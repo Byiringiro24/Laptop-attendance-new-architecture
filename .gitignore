@@ -1,0 +1,100 @@
+# ── Build artifacts ───────────────────────────────────────────────────────────
+FKBridge/bin/
+FKBridge/obj/
+
+# ── Node.js ───────────────────────────────────────────────────────────────────
+backend/node_modules/
+frontend/node_modules/
+frontend/.next/
+frontend/.turbo/
+node_modules/
+package-lock.json
+frontend/package-lock.json
+backend/package-lock.json
+frontend/tsconfig.tsbuildinfo
+
+# ── Local tablet data (unique per tablet — never commit) ──────────────────────
+backend/data/device-config.json
+backend/data/devices-list.json
+backend/data/wireguard-private.key
+backend/data/wireguard-public.key
+backend/data/attendance-settings.json
+backend/data/poll-state.json
+backend/data/students.json
+# Keep the cache directory structure (via .gitkeep) but ignore the actual photos
+backend/cache/photos/**/*.jpg
+backend/cache/photos/**/*.jpeg
+backend/cache/photos/**/*.png
+backend/cache/photos/**/*.webp
+backend/cache/photos/**/*.meta.json
+# Ignore the manifest but keep the directory skeleton
+!backend/cache/photos/all-rooms/.gitkeep
+backend/.env
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Environment ───────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.production
+.env.*.local
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Temp / debug ──────────────────────────────────────────────────────────────
+.tmp/
+*.tmp
+*.bak
+*.bundle
+
+# ── Junk / old files — these should never come back ──────────────────────────
+*.docx
+*.docm
+pst\ gress.md
+jj.md
+testing_Comit
+new\ changes*
+updating\ Tablets.txt
+branch_structure.json
+deploy-to-server.sh
+pull-safe.bat
+run-as-admin.bat
+set-admin-permanent.ps1
+setup-new-tablet.ps1
+install-services.ps1
+uninstall-services.ps1
+INSTALL\ *
+SETUP-NEW-TABLET.bat
+INSTALL-ROOT.md
+PRODUCTION-READINESS-VALIDATION.md
+QUICK-REFERENCE-GUIDE.md
+Super\ Admin*
+test_logins.ps1
+readme.md
+wireguard-setup.md
+Wireguard.md
+Wireguard\ *
+WireGuard\ *
+database/
+"Tablet Setup Scripts/README.md"
+"Tablet Setup Scripts/Readme.docx"
+"Tablet Setup Scripts/"
+scripts/deploy-repos.ps1
+scripts/ensure-install-root.ps1
+scripts/git-templates/
+scripts/install-git-hooks.ps1
+scripts/setup-machine.ps1
+scripts/update-repos.ps1
+frontend/README.md
+frontend/next.config.mjs
+frontend/postcss.config.mjs
+frontend/tailwind.config.ts

@@ -1,0 +1,110 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    --toast-bg: #0f172a;
+    --toast-border: rgba(51, 65, 85, 0.9);
+    --toast-text: #e2e8f0;
+  } 
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    min-width: 320px;
+    height: 100%;
+    overflow: hidden;
+    background: #070b14;
+  }
+
+  body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background:
+      radial-gradient(circle at top left, rgba(6, 182, 212, 0.12), transparent 32rem),
+      linear-gradient(135deg, #070b14 0%, #0f172a 48%, #111827 100%);
+    color: #e5e7eb;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  button,
+  input,
+  select {
+    font: inherit;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+
+  ::selection {
+    background: rgba(34, 211, 238, 0.28);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: #0f172a;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    border: 2px solid #0f172a;
+    border-radius: 999px;
+    background: #334155;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #475569;
+  }
+}
+
+@layer components {
+  .app-shell {
+    @apply min-h-screen w-full bg-transparent text-slate-100;
+  }
+
+  .dashboard-panel {
+    @apply rounded-2xl border border-slate-800/90 bg-slate-900/95 shadow-lg backdrop-blur-sm;
+  }
+
+  .metric-card {
+    @apply dashboard-panel p-5 transition duration-200 hover:-translate-y-0.5 hover:border-cyan-500/35 hover:shadow-2xl;
+  }
+
+  .form-field {
+    @apply w-full rounded-xl border border-slate-700 bg-slate-800/90 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/15;
+  }
+
+  .primary-action {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-cyan-500 px-4 py-2.5 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-500/15 transition hover:bg-cyan-300 disabled:opacity-50;
+  }
+
+  .secondary-action {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2.5 text-sm font-semibold text-slate-100 transition hover:border-slate-500 hover:bg-slate-700 disabled:opacity-50;
+  }
+
+  .data-table {
+    @apply min-w-[1040px] w-full border-separate border-spacing-0 text-left text-sm;
+  }
+
+  .data-table th {
+    @apply border-b border-slate-800 bg-slate-900/80 px-4 py-3 text-xs font-semibold uppercase tracking-wide text-slate-400;
+  }
+
+  .data-table td {
+    @apply border-b border-slate-800 px-4 py-3 align-middle text-slate-200;
+  }
+
+  .data-table tbody tr {
+    @apply transition hover:bg-slate-800/55;
+  }
+}

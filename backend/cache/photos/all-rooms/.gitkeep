@@ -1,0 +1,3 @@
+# This file ensures git creates the photos/all-rooms/ directory.
+# Student photos are downloaded here at runtime and are gitignored.
+# The directory must exist before the server starts so photo writes succeed.

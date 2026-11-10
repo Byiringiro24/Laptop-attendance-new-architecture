@@ -1,0 +1,65 @@
+{
+  "Version": 1,
+
+  "Paths": {
+    "Root":         "C:\\Attendance_managment_system\\Attendance_managment_system",
+    "Repo":         "C:\\Attendance_managment_system\\Attendance_managment_system",
+    "Backend":      "C:\\Attendance_managment_system\\Attendance_managment_system\\backend",
+    "Frontend":     "C:\\Attendance_managment_system\\Attendance_managment_system\\frontend",
+    "FKBridge":     "C:\\Attendance_managment_system\\Attendance_managment_system\\FKBridge",
+    "Scripts":      "C:\\Attendance_managment_system\\Attendance_managment_system\\scripts",
+    "Logs":         "C:\\Attendance_managment_system\\Attendance_managment_system\\logs",
+    "Backups":      "C:\\Attendance_managment_system\\Attendance_managment_system\\backups",
+    "ChromeProfile":"C:\\Attendance_managment_system\\Attendance_managment_system\\chrome-profile",
+    "Provisioning": "C:\\Attendance_managment_system\\Attendance_managment_system\\provisioning"
+  },
+
+  "Git": {
+    "Repository":        "https://github.com/Byiringiro24/Tablet_Setup.git",
+    "Branch":            "Testing-Branch",
+    "AutoUpdate":        true,
+    "RollbackOnFailure": true
+  },
+
+  "Runtime": {
+    "BackendPort":           5000,
+    "FrontendPort":          3000,
+    "DevicePort":            5005,
+    "BackendHealth":         "/api/health",
+    "BackendApiUrl":         "http://localhost:5000",
+    "ProductionBackendApiUrl": "https://backend.ecareafrica.net/api/v1"
+  },
+
+  "Device": {
+    "License":                   1261,
+    "DefaultBiometricDeviceIp":  "192.168.1.76",
+    "DefaultBiometricDevicePort": 5005,
+    "TimeoutMs":                 10000
+  },
+
+  "Network": {
+    "WireGuardEndpoint":   "169.58.124.150:51820",
+    "WireGuardAllowedIPs": "10.0.0.0/16",
+    "WireGuardDns":        "1.1.1.1",
+    "ServerApiUrl":        "https://backend.ecareafrica.net/api/v1"
+  },
+
+  "Kiosk": {
+    "ChromeUrl":            "http://localhost:3000",
+    "StartupDelaySeconds":  15
+  },
+
+  "Task": {
+    "Name":                "EcaAfrica Kiosk",
+    "RestartEveryMinutes":  5
+  },
+
+  "Prerequisites": {
+    "InstallWithWinget":           true,
+    "GitId":                       "Git.Git",
+    "NodeId":                      "OpenJS.NodeJS.LTS",
+    "ChromeId":                    "Google.Chrome",
+    "WireGuardId":                 "WireGuard.WireGuard",
+    "DotNetDesktopRuntimeX86Id":   "Microsoft.DotNet.DesktopRuntime.8"
+  }
+}
