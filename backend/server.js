@@ -396,11 +396,104 @@ function startLogPoll() {
   pollBusy = false;
   logPollTimer = setInterval(runLogPoll, 2000);
   console.log('[poll] Auto-poll started (every 2s). lastSeenLogId=' + pollState.lastSeenLogId);
+  startStatusCheck(); // always start the real STATUS health-check alongside the log poll
 }
 
 function stopLogPoll() {
   if (logPollTimer) { clearInterval(logPollTimer); logPollTimer = null; }
   pollBusy = false;
+  stopStatusCheck(); // always stop the STATUS check when the log poll stops
+}
+
+// ── Live STATUS health-check — runs every 15s when connected ─────────────────
+// The log poll (every 2s) detects disconnects via error responses, but it only
+// runs when logs are flowing. The STATUS check is independent: it asks FKBridge
+// "are you still connected?" and emits SSE immediately when the answer changes.
+// This ensures the frontend always shows real connectivity, not stale state.
+let statusCheckTimer = null;
+let statusCheckBusy = false;
+
+function startStatusCheck() {
+  if (statusCheckTimer) return;
+  statusCheckTimer = setInterval(runStatusCheck, 15000);
+}
+
+function stopStatusCheck() {
+  if (statusCheckTimer) { clearInterval(statusCheckTimer); statusCheckTimer = null; }
+  statusCheckBusy = false;
+}
+
+async function runStatusCheck() {
+  // Run whenever the status check timer fires — even if currentDevice looks connected.
+  // The whole point is to verify the in-memory state against reality.
+  if (statusCheckBusy || !bridgeReady) return;
+  statusCheckBusy = true;
+  try {
+    const result = await sendCommand('STATUS', 4000);
+    if (result.success && result.data) {
+      const wasConnected = !!(currentDevice && currentDevice.connected);
+      const isConnected  = Boolean(result.data.connected);
+      setActiveDeviceSession(result.data);
+
+      if (isConnected !== wasConnected) {
+        // State changed — emit SSE immediately
+        sseEmit('deviceStatus', {
+          connected: isConnected,
+          ipAddress: result.data.ipAddress || activeDeviceConfig?.ipAddress || null,
+          deviceId:  result.data.deviceId  || null,
+          source:    'status-check',
+        });
+      }
+
+      if (!isConnected) {
+        // Device reports not connected — treat as silent disconnect
+        currentDevice = null;
+        stopLogPoll();
+        if (autoConnectEnabled) {
+          autoConnectAttempt = 0;
+          scheduleAutoConnect(3000);
+        }
+      }
+    } else {
+      // Bridge returned failure — device is unreachable or disconnected
+      const wasConnected = !!(currentDevice && currentDevice.connected);
+      console.log('[status-check] Device offline detected:', result.error || 'no response');
+      currentDevice = null;
+
+      if (wasConnected) {
+        // Only emit and trigger reconnect if we thought it was connected before
+        sseEmit('deviceStatus', {
+          connected: false,
+          ipAddress: activeDeviceConfig?.ipAddress || null,
+          error: result.error || 'Device not reachable',
+          source: 'status-check',
+        });
+        stopLogPoll();
+        if (autoConnectEnabled) {
+          autoConnectAttempt = 0;
+          scheduleAutoConnect(3000);
+        }
+      }
+    }
+  } catch (err) {
+    const wasConnected = !!(currentDevice && currentDevice.connected);
+    currentDevice = null;
+    if (wasConnected) {
+      sseEmit('deviceStatus', {
+        connected: false,
+        ipAddress: activeDeviceConfig?.ipAddress || null,
+        error: err.message,
+        source: 'status-check',
+      });
+      stopLogPoll();
+      if (autoConnectEnabled) {
+        autoConnectAttempt = 0;
+        scheduleAutoConnect(3000);
+      }
+    }
+  } finally {
+    statusCheckBusy = false;
+  }
 }
 
 /**
@@ -1402,8 +1495,9 @@ app.get('/api/health', async (req, res) => {
   // Fetch real-time FK623 status via STATUS command (non-blocking, 3s timeout)
   // This ensures /api/health always returns actual device connectivity,
   // not stale in-memory state from the last auto-connect cycle.
+  // Default connected=false — only set true if the live STATUS command confirms it.
   let fk623Status = {
-    connected: !!(currentDevice && currentDevice.connected),
+    connected: false,
     deviceId:  currentDevice?.deviceId  || null,
     ipAddress: activeDeviceConfig?.ipAddress || savedConfig?.ipAddress || null,
     port:      activeDeviceConfig?.port      || savedConfig?.port      || 5005,
@@ -1411,7 +1505,7 @@ app.get('/api/health', async (req, res) => {
     logs:      currentDevice?.logCount        || 0,
   };
 
-  // If bridge is ready, do a live STATUS check to get truly current state
+  // Live STATUS check — always attempt this; skip only if another check is in-flight
   if (bridgeReady && !fk623StatusInProgress) {
     fk623StatusInProgress = true;
     try {
@@ -1429,13 +1523,20 @@ app.get('/api/health', async (req, res) => {
           users:      result.data.deviceUserCount || result.data.users || 0,
           logs:       result.data.logCount        || result.data.logs  || 0,
         };
-      } else if (!result.success) {
-        // STATUS failed — FK623 disconnected
+        if (!fk623Status.connected) {
+          // Device responded but says not connected
+          currentDevice = null;
+        }
+      } else {
+        // STATUS failed — FK623 disconnected or unreachable
         currentDevice = null;
         fk623Status.connected = false;
       }
-    } catch { /* non-fatal */ }
+    } catch { fk623Status.connected = false; currentDevice = null; }
     finally { fk623StatusInProgress = false; }
+  } else if (fk623StatusInProgress) {
+    // Another health check is already running — report unknown rather than stale true
+    fk623Status.connected = false;
   }
 
   const selectedSession = getSelectedDeviceSession(deviceSessions, currentDevice) || currentDevice;
@@ -1672,11 +1773,25 @@ app.get('/api/device/status', async (req, res) => {
   const result = await sendCommand('STATUS', 5000);
   if (result.success) {
     setActiveDeviceSession(result.data);
+    // Emit real connected status so any SSE subscriber gets it immediately
+    sseEmit('deviceStatus', {
+      connected: Boolean(result.data?.connected),
+      ipAddress: result.data?.ipAddress || activeDeviceConfig?.ipAddress || null,
+      deviceId:  result.data?.deviceId  || null,
+    });
   } else {
-    // STATUS failed ├óΓé¼ΓÇ¥ device is offline, clear it so frontend shows disconnected
+    // STATUS failed — device is offline, clear it so frontend shows disconnected
     currentDevice = null;
     stopLogPoll();
-    if (autoConnectEnabled) scheduleAutoConnect(3000);
+    sseEmit('deviceStatus', {
+      connected: false,
+      ipAddress: activeDeviceConfig?.ipAddress || null,
+      error: result.error || 'Device not reachable',
+    });
+    if (autoConnectEnabled) {
+      autoConnectAttempt = 0; // reset so retry starts with fast 3s backoff, not 30s
+      scheduleAutoConnect(3000);
+    }
   }
   apiResult(res, result);
 });
@@ -3285,10 +3400,18 @@ app.post('/api/device/set-ip', async (req, res) => {
   saveEnvKey('DEVICE_PORT', String(Number(port) || 5005));
   if (license !== 1261) saveEnvKey('DEVICE_LICENSE', String(Number(license) || 1261));
 
+  // Cancel any pending auto-connect retry — config changed, start fresh
+  if (autoConnectTimer) { clearTimeout(autoConnectTimer); autoConnectTimer = null; }
+  autoConnectAttempt = 0;
+  currentDevice = null;
+  stopLogPoll();
+
+  // Notify frontend immediately: config saved, connecting now
+  sseEmit('deviceStatus', { connected: false, ipAddress, configChanged: true, message: 'Config saved — connecting...' });
+
   // Immediately attempt connection with the new IP
   let connectResult = null;
   try {
-    stopLogPoll();
     await ensureBridge();
     const result = await sendCommand(
       `CONNECT|${cfg.ipAddress}|${cfg.port}|${cfg.license}|${cfg.deviceId}|${cfg.netPassword}|${cfg.protocolType}|${cfg.timeoutMs}`,
@@ -3302,12 +3425,19 @@ app.post('/api/device/set-ip', async (req, res) => {
       refreshTabletDeviceAssignments().catch(() => null);
       startLogPoll();
       connectResult = { connected: true, device: result.data };
+      // Emit real connected status immediately over SSE
+      sseEmit('deviceStatus', { connected: true, ipAddress, deviceId: result.data?.deviceId || '' });
+      scheduleAutoConnect(30000); // health-check in 30s
     } else {
       connectResult = { connected: false, error: result.error };
+      sseEmit('deviceStatus', { connected: false, ipAddress, error: result.error || 'Device not reachable' });
+      autoConnectAttempt = 0; // reset so retry starts from attempt #1 with 3s backoff
       scheduleAutoConnect(3000);
     }
   } catch (err) {
     connectResult = { connected: false, error: err.message };
+    sseEmit('deviceStatus', { connected: false, ipAddress, error: err.message });
+    autoConnectAttempt = 0;
     scheduleAutoConnect(3000);
   }
 
@@ -3452,10 +3582,14 @@ app.post('/api/devices-config/:id/connect', async (req, res) => {
         if (i !== -1) { updatedList[i].deviceId = result.data.deviceId; updatedList[i].updatedAt = new Date().toISOString(); saveDevicesList(updatedList); }
       }
       sseEmit('devicesStatus', { id, connected: true, ipAddress });
+      // Also emit the main deviceStatus event so the dashboard and frontend
+      // connection state updates immediately without waiting for the next poll
+      sseEmit('deviceStatus', { connected: true, ipAddress, deviceId: result.data?.deviceId || deviceId });
       res.json({ success: true, connected: true, device: result.data });
     } else {
       deviceStatusMap.set(id, { connected: false, lastAttempt: new Date().toISOString(), error: result.error });
       sseEmit('devicesStatus', { id, connected: false, ipAddress, error: result.error });
+      sseEmit('deviceStatus', { connected: false, ipAddress, error: result.error || 'Device not reachable' });
       res.json({ success: false, connected: false, error: result.error });
     }
   } catch (err) {
