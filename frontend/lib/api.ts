@@ -7,6 +7,11 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
+/** Build config with the dev-password header when provided. */
+function devCfg(devPw?: string) {
+  return devPw ? { headers: { 'X-Dev-Password': devPw } } : {};
+}
+
 export const deviceApi = {
   connect: (data: { deviceId?: string; ipAddress: string; port: number; license?: number; [key: string]: any }) => api.post('/device/connect', data),
   connectSaved: () => api.post('/device/connect-saved'),
@@ -16,23 +21,36 @@ export const deviceApi = {
   getSessions: () => api.get('/device/sessions'),
   selectSession: (data: { sessionId?: string; deviceId?: string; ipAddress?: string; address?: string }) => api.post('/device/select-session', data),
   routeCommand: (data: { command: string; sessionId?: string; deviceId?: string; ipAddress?: string; address?: string; timeoutMs?: number }) => api.post('/device/route-command', data),
-  syncTime: () => api.post('/device/sync-time'),
-  setTime: (timestamp: string) => api.post('/device/set-time', { timestamp }),
-  pullLogs: (readMark = 0) => api.post('/device/pull-logs', { readMark }),
-  pullUsers: () => api.get('/device/users'),
-  getUsers: () => api.get('/device/users'),
-  pushStudents: (studentIds?: string[]) => api.post('/device/push-students', { studentIds }),
-  clearLogs: () => api.post('/device/clear-logs'),
-  powerOff: () => api.post('/device/poweroff'),
-  clearAll: () => api.post('/device/clear-all'),
-  /** Save device config to backend without connecting (used by Developer modal) */
+  /** Requires dev password */
+  syncTime: (devPw?: string) => api.post('/device/sync-time', {}, devCfg(devPw)),
+  setTime: (timestamp: string, devPw?: string) => api.post('/device/set-time', { timestamp }, devCfg(devPw)),
+  /** Requires dev password */
+  pullLogs: (readMark = 0, devPw?: string) => api.post('/device/pull-logs', { readMark }, devCfg(devPw)),
+  /** Requires dev password */
+  getUsers: (devPw?: string) => api.get('/device/users', devCfg(devPw)),
+  pullUsers: (devPw?: string) => api.get('/device/users', devCfg(devPw)),
+  /** Requires dev password */
+  pushStudents: (studentIds?: string[], devPw?: string) => api.post('/device/push-students', { studentIds }, devCfg(devPw)),
+  /** Requires dev password */
+  clearLogs: (devPw?: string) => api.post('/device/clear-logs', {}, devCfg(devPw)),
+  /** Requires dev password */
+  powerOff: (devPw?: string) => api.post('/device/poweroff', {}, devCfg(devPw)),
+  /** Requires dev password */
+  clearAll: (devPw?: string) => api.post('/device/clear-all', {}, devCfg(devPw)),
   saveConfig: (data: { deviceId?: string; ipAddress: string; port: number; license?: number; [key: string]: any }) => api.post('/device/connect', { ...data, saveConfig: true }),
 };
 
 export const studentApi = {
-  getAll: () => api.get('/students'),
-  create: (data: any) => api.post('/students', data),
-  delete: (id: string) => api.delete(`/students/${id}`),
+  getAll: (params?: { deviceId?: string; date?: string; search?: string; class?: string }) => {
+    const qs = params ? '?' + new URLSearchParams(
+      Object.fromEntries(Object.entries(params).filter(([, v]) => v && String(v).trim()))
+    ).toString() : '';
+    return api.get(`/students${qs}`);
+  },
+  /** Requires dev password — sends to device */
+  create: (data: any, devPw?: string) => api.post('/students', data, devCfg(devPw)),
+  /** Requires dev password — deletes from device */
+  delete: (id: string, devPw?: string) => api.delete(`/students/${id}`, devCfg(devPw)),
 };
 
 export const attendanceApi = {

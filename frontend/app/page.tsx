@@ -7,7 +7,8 @@ import {
   FiEye, FiEyeOff, FiLock, FiRefreshCw, FiServer,
   FiSettings, FiShield, FiUploadCloud, FiUsers,
   FiX, FiUserCheck, FiCpu, FiMapPin, FiZap,
-  FiAlertTriangle, FiLogOut,
+  FiAlertTriangle, FiLogOut, FiPlus, FiEdit2, FiTrash2,
+  FiWifi, FiWifiOff, FiLoader,
 } from "react-icons/fi";
 import {
   dashboardApi, deviceApi, studentApi,
@@ -28,6 +29,13 @@ import LiveAttendanceScreen  from "@/components/LiveAttendanceScreen";
 import WireguardWizard       from "@/components/WireguardWizard";
 import DeviceUsersPanel      from "@/components/DeviceUsersPanel";
 import DevicesPage           from "@/components/DevicesPage";
+
+/* ─── Types ──────────────────────────────────────────── */
+type RegisteredDevice = {
+  id: string; name: string; ipAddress: string; port: number;
+  license: number; deviceId: string; location: string; notes: string;
+  status: { connected: boolean; error?: string; lastAttempt?: string };
+};
 
 /* ─── Constants ──────────────────────────────────────── */
 const WG_SERVER_ENDPOINT_DEFAULT = "169.58.124.150:51820";
@@ -111,6 +119,23 @@ export default function SmartAttendanceDashboard() {
   const [tabletLocation,    setTabletLocation]    = useState<string | null>(null);
   const [schoolName,        setSchoolName]        = useState<string | null>(null);
   const [devPasswordActual, setDevPasswordActual] = useState("admin1234");
+
+  // ── Registered biometric devices (persisted in backend data/devices-list.json) ──
+  const [registeredDevices, setRegisteredDevices] = useState<RegisteredDevice[]>([]);
+  const [deviceBusy, setDeviceBusy] = useState<Set<string>>(new Set());
+
+  const loadRegisteredDevices = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/api/devices-config`);
+      const d = await r.json();
+      if (d.success) setRegisteredDevices(d.devices || []);
+    } catch {}
+  };
+
+  // Dev modal inline device management state
+  const [devDeviceForm, setDevDeviceForm] = useState({ name: "", ipAddress: "", port: 5005, license: 1261, location: "", notes: "" });
+  const [devDeviceEditId, setDevDeviceEditId] = useState<string | null>(null);
+  const [devDeviceFormOpen, setDevDeviceFormOpen] = useState(false);
 
   const handleDeviceChoiceChange = async (nextName: string) => {
     setSelectedDeviceName(nextName);
@@ -244,6 +269,19 @@ export default function SmartAttendanceDashboard() {
         }
       } catch {}
     });
+    // Live device list + per-device status updates
+    es.addEventListener("devicesInit", (e: MessageEvent) => {
+      try { const list = JSON.parse(e.data); if (Array.isArray(list)) setRegisteredDevices(list); } catch {}
+    });
+    es.addEventListener("devicesStatus", (e: MessageEvent) => {
+      try {
+        const { id, connected: conn, error } = JSON.parse(e.data);
+        setRegisteredDevices(prev => prev.map(d =>
+          d.id === id ? { ...d, status: { connected: conn, error, lastAttempt: new Date().toISOString() } } : d
+        ));
+        setDeviceBusy(prev => { const s = new Set(prev); s.delete(id); return s; });
+      } catch {}
+    });
     es.onerror = () => { es.close(); sseRef.current = null; sseReconnectRef.current = setTimeout(connectSSE, 3000); };
     sseRef.current = es;
   }
@@ -292,6 +330,7 @@ export default function SmartAttendanceDashboard() {
     connectSSE();
     attemptConnect(0);
     fetch(`${API_BASE}/api/health`).then(r => r.json()).then(applyServerHealth).catch(() => {});
+    loadRegisteredDevices();
     const hiv = setInterval(() => {
       fetch(`${API_BASE}/api/health`).then(r => r.json()).then(applyServerHealth).catch(() => {});
     }, 30000);
@@ -357,48 +396,126 @@ export default function SmartAttendanceDashboard() {
     } catch {}
   }
 
+  /* ── Dev-auth gate ─────────────────────────────────────────────────────────
+   * Any function that sends data to / reads data from the physical device
+   * must call withDevAuth(fn). It shows a minimal inline password modal,
+   * verifies the developer password, then calls fn() with the password so
+   * the backend requireDevPassword middleware accepts the request.
+   *
+   * The password is passed as a custom header (X-Dev-Password) on all
+   * device-data API calls so the backend can validate it.
+   * ─────────────────────────────────────────────────────────────────────── */
+  const [devAuthOpen,       setDevAuthOpen]       = useState(false);
+  const [devAuthPassword,   setDevAuthPassword]   = useState("");
+  const [devAuthError,      setDevAuthError]      = useState("");
+  const [devAuthBusy,       setDevAuthBusy]       = useState(false);
+  const [devAuthShowPw,     setDevAuthShowPw]     = useState(false);
+  const devAuthPendingRef   = useRef<((pw: string) => Promise<void>) | null>(null);
+  const devAuthResolvedPwRef = useRef<string>("");  // cache verified pw for the session
+
+  /** Wrap a device-data operation behind the dev password gate. */
+  function withDevAuth(fn: (pw: string) => Promise<void>) {
+    // If we already verified the password this session, skip the modal
+    if (devAuthResolvedPwRef.current) { void fn(devAuthResolvedPwRef.current); return; }
+    devAuthPendingRef.current = fn;
+    setDevAuthPassword(""); setDevAuthError(""); setDevAuthShowPw(false);
+    setDevAuthOpen(true);
+  }
+
+  async function submitDevAuth(e: React.FormEvent) {
+    e.preventDefault();
+    if (devAuthPassword !== devPasswordActual) {
+      setDevAuthError("Incorrect password"); setDevAuthPassword(""); return;
+    }
+    setDevAuthBusy(true); setDevAuthError("");
+    devAuthResolvedPwRef.current = devAuthPassword;
+    const fn = devAuthPendingRef.current;
+    setDevAuthOpen(false); setDevAuthPassword("");
+    devAuthPendingRef.current = null;
+    if (fn) await fn(devAuthResolvedPwRef.current).catch(() => null);
+    setDevAuthBusy(false);
+  }
+
+  /** Helper: extract a user-friendly message from an axios/fetch error,
+   *  handling the device_not_connected and dev_password_required codes. */
+  function handleDeviceError(e: any, fallback = "Operation failed"): void {
+    const data = e?.response?.data ?? e?.data ?? {};
+    const code = data?.code ?? "";
+    const msg  = data?.error ?? e?.message ?? fallback;
+
+    if (code === "device_not_connected") {
+      setDevice(null); setConnected(false); setConnectStatus("retrying");
+      toast.error("Device went offline. Reconnecting…", { id: "ac" });
+      if (autoConnectRef.current) clearTimeout(autoConnectRef.current);
+      attemptConnect(0);
+      return;
+    }
+    if (code === "dev_password_required" || code === "dev_password_incorrect") {
+      // Password was cached but server rejected — invalidate cache and re-prompt
+      devAuthResolvedPwRef.current = "";
+      toast.error("Developer password required");
+      return;
+    }
+    toast.error(msg);
+  }
+
   async function pullLogs() {
-    setBusy(true);
-    try {
-      const res = await deviceApi.pullLogs(readMode);
-      if (res.data) {
-        const pulled = (res.data as AttendanceLog[]).filter(l => !knownLogIds.current.has(l.id));
-        pulled.forEach(l => knownLogIds.current.add(l.id));
-        setLogs(p => [...pulled, ...p].slice(0, 500));
-        toast.success(`Pulled ${pulled.length} new log${pulled.length !== 1 ? "s" : ""}`);
-      }
-    } catch (e: any) { toast.error(e?.message || "Pull failed"); }
-    finally { setBusy(false); }
+    withDevAuth(async (pw) => {
+      setBusy(true);
+      try {
+        const res = await deviceApi.pullLogs(readMode, pw);
+        if (res.data) {
+          const pulled = (res.data as AttendanceLog[]).filter(l => !knownLogIds.current.has(l.id));
+          pulled.forEach(l => knownLogIds.current.add(l.id));
+          setLogs(p => [...pulled, ...p].slice(0, 500));
+          toast.success(`Pulled ${pulled.length} new log${pulled.length !== 1 ? "s" : ""}`);
+        }
+      } catch (e: any) { handleDeviceError(e, "Pull logs failed"); }
+      finally { setBusy(false); }
+    });
   }
+
   async function pullUsers() {
-    setBusy(true);
-    try {
-      const res = await deviceApi.getUsers();
-      const raw = res.data as any;
-      const list: DeviceUser[] = Array.isArray(raw) ? raw : raw?.data ?? raw?.users ?? [];
-      setDeviceUsers(list);
-      toast.success(`Loaded ${list.length} device user${list.length !== 1 ? "s" : ""}`);
-    } catch (e: any) { toast.error(e?.message || "Failed"); }
-    finally { setBusy(false); }
+    withDevAuth(async (pw) => {
+      setBusy(true);
+      try {
+        const res = await deviceApi.getUsers(pw);
+        const raw = res.data as any;
+        const list: DeviceUser[] = Array.isArray(raw) ? raw : raw?.data ?? raw?.users ?? [];
+        setDeviceUsers(list);
+        toast.success(`Loaded ${list.length} device user${list.length !== 1 ? "s" : ""}`);
+      } catch (e: any) { handleDeviceError(e, "Get users failed"); }
+      finally { setBusy(false); }
+    });
   }
+
   async function syncTime() {
-    setBusy(true);
-    try { await deviceApi.syncTime(); toast.success("Device time synced"); }
-    catch (e: any) { toast.error(e?.message || "Sync failed"); }
-    finally { setBusy(false); }
+    withDevAuth(async (pw) => {
+      setBusy(true);
+      try { await deviceApi.syncTime(pw); toast.success("Device time synced"); }
+      catch (e: any) { handleDeviceError(e, "Sync time failed"); }
+      finally { setBusy(false); }
+    });
   }
+
   async function pushStudents() {
-    setBusy(true);
-    try {
-      const res = await deviceApi.pushStudents();
-      const d = res.data as any;
-      toast.success(`Pushed ${d?.pushed ?? d?.pushed_count ?? "?"} students to device`);
-    } catch (e: any) { toast.error(e?.message || "Push failed"); }
-    finally { setBusy(false); }
+    withDevAuth(async (pw) => {
+      setBusy(true);
+      try {
+        const res = await deviceApi.pushStudents(undefined, pw);
+        const d = res.data as any;
+        const pushed = d?.data?.pushed ?? d?.pushed ?? "?";
+        const failed = d?.data?.failed ?? 0;
+        if (failed > 0) toast.error(`${pushed} pushed, ${failed} failed — check device connection`);
+        else toast.success(`Pushed ${pushed} student${pushed !== 1 ? "s" : ""} to device`);
+      } catch (e: any) { handleDeviceError(e, "Push students failed"); }
+      finally { setBusy(false); }
+    });
   }
+
   async function loadStudentsLocal() {
     setBusy(true);
-    try { const res = await studentApi.getAll(); setStudents(res.data as Student[] || []); }
+    try { const res = await studentApi.getAll(); setStudents((res.data as any)?.students ?? res.data ?? []); }
     catch (e: any) { toast.error(e?.message || "Failed"); }
     finally { setBusy(false); }
   }
@@ -703,16 +820,33 @@ export default function SmartAttendanceDashboard() {
             <SideSelect label="Class" value={studentForm.className} onChange={v => setStudentForm(f => ({...f, className: v}))} options={CLASS_LIST} />
             <SideField label="Section" value={studentForm.section} onChange={v => setStudentForm(f => ({...f, section: v}))} placeholder="A / B / C" />
             <SideField label="Parent Phone" value={studentForm.parentPhone} onChange={v => setStudentForm(f => ({...f, parentPhone: v}))} placeholder="+250..." />
-            <button onClick={async () => {
+            <button onClick={() => {
               if (!studentForm.name || !studentForm.studentDeviceId) { toast.error("Name and device ID required"); return; }
-              setBusy(true);
-              try {
-                await studentApi.create({ name: studentForm.name, studentId: studentForm.studentId, studentDeviceId: studentForm.studentDeviceId, className: studentForm.className, section: studentForm.section, parentPhone: studentForm.parentPhone });
-                toast.success(`${studentForm.name} registered`);
-                setStudentForm({ name:"", studentId:"", studentDeviceId:"", className: CLASS_LIST[0], section:"", assignedDeviceId:"", parentPhone:"" });
-                await loadStudentsLocal();
-              } catch (e: any) { toast.error(e?.message || "Failed"); }
-              setBusy(false);
+              withDevAuth(async (pw) => {
+                setBusy(true);
+                try {
+                  const res = await studentApi.create({
+                    name: studentForm.name, studentId: studentForm.studentId,
+                    studentDeviceId: studentForm.studentDeviceId, className: studentForm.className,
+                    section: studentForm.section, parentPhone: studentForm.parentPhone,
+                  }, pw);
+                  const d = res.data as any;
+                  if (d?.savedLocally && d?.code === "device_not_connected") {
+                    toast.success(`${studentForm.name} saved locally`, { icon: "💾" });
+                    toast.error("Device offline — student will be pushed when device reconnects");
+                    setDevice(null); setConnected(false); setConnectStatus("retrying");
+                    if (autoConnectRef.current) clearTimeout(autoConnectRef.current);
+                    attemptConnect(0);
+                  } else if (d?.success !== false) {
+                    toast.success(`${studentForm.name} registered & pushed to device`);
+                  } else {
+                    toast.error(d?.error || "Registration failed");
+                  }
+                  setStudentForm({ name:"", studentId:"", studentDeviceId:"", className: CLASS_LIST[0], section:"", assignedDeviceId:"", parentPhone:"" });
+                  await loadStudentsLocal();
+                } catch (e: any) { handleDeviceError(e, "Registration failed"); }
+                setBusy(false);
+              });
             }} disabled={busy} className="w-full rounded-xl bg-cyan-600 py-3 text-sm font-semibold text-white hover:bg-cyan-500 disabled:opacity-50 touch-manipulation shrink-0">
               Register Student
             </button>
@@ -864,31 +998,109 @@ export default function SmartAttendanceDashboard() {
               <div className="grid shrink-0 grid-cols-2 gap-3 sm:grid-cols-4">
                 <SummaryTile label="Students"    value={stats.totalStudents}   color="cyan" />
                 <SummaryTile label="Scans Today" value={stats.attendanceToday} color="emerald" />
-                <SummaryTile label="Device" value={connected ? "Online" : connectStatus === "connecting" ? "Connecting..." : "Offline"} color={connected ? "green" : "red"} />
+                <SummaryTile
+                  label="Devices Online"
+                  value={registeredDevices.length > 0
+                    ? `${registeredDevices.filter(d => d.status?.connected).length}/${registeredDevices.length}`
+                    : connected ? "1/1" : "0"}
+                  color={registeredDevices.some(d => d.status?.connected) || connected ? "green" : "red"}
+                />
                 <SummaryTile label="Total Logs"  value={stats.totalLogs}       color="slate" />
               </div>
 
               {/* Cards */}
               <div className="grid gap-4 lg:grid-cols-2 shrink-0">
 
-                {/* Device Status */}
+                {/* ── Devices Status ─────────────────────────── */}
                 <div className="dashboard-panel p-5">
                   <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-base font-bold flex items-center gap-2"><FiServer className="text-cyan-400" /> Device Status</h3>
-                    <span className={`text-xs font-bold rounded-full px-2.5 py-1 ${connected ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30" : "bg-red-500/15 text-red-400 border border-red-500/30"}`}>
-                      {connected ? "Online" : connectStatus === "connecting" ? "Connecting..." : "Offline"}
-                    </span>
+                    <h3 className="text-base font-bold flex items-center gap-2">
+                      <FiServer className="text-cyan-400" /> Devices
+                      <span className="text-[11px] font-normal text-slate-500">
+                        {registeredDevices.filter(d => d.status?.connected).length}/{registeredDevices.length} online
+                      </span>
+                    </h3>
+                    <button onClick={openDevModal}
+                      className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-[11px] text-slate-400 hover:text-white transition touch-manipulation">
+                      <FiSettings className="text-[10px]" /> Manage
+                    </button>
                   </div>
-                  <div className="space-y-2.5 mb-4">
-                    <InfoRow label="IP Address" value={deviceForm.ipAddress || "Not set"} valueClass={deviceForm.ipAddress ? "text-slate-200 font-mono text-xs" : "text-amber-400 text-xs"} />
-                    <InfoRow label="Port"    value={String(deviceForm.port || 5005)} />
-                    <InfoRow label="License" value={String(deviceForm.license || "—")} />
-                    {deviceForm.location && <InfoRow label="Location" value={deviceForm.location} />}
-                    {device?.serialNumber  && <InfoRow label="Serial"  value={device.serialNumber} />}
-                    {device?.productName   && <InfoRow label="Model"   value={device.productName} />}
-                    {(device?.users ?? 0) > 0 && <InfoRow label="Users on Device" value={String(device!.users)} valueClass="text-cyan-300 font-bold" />}
-                    {(device?.logs  ?? 0) > 0 && <InfoRow label="Logs in Device"  value={String(device!.logs)} />}
-                  </div>
+
+                  {/* No devices registered yet */}
+                  {registeredDevices.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-slate-700 py-6 text-center mb-4">
+                      <FiCpu className="mx-auto text-2xl text-slate-700 mb-1.5" />
+                      <p className="text-xs text-slate-500 mb-2">No devices registered</p>
+                      <button onClick={openDevModal}
+                        className="inline-flex items-center gap-1 rounded-xl bg-cyan-600 hover:bg-cyan-500 px-3 py-1.5 text-xs font-semibold text-white transition">
+                        <FiPlus className="text-[11px]" /> Add Device
+                      </button>
+                    </div>
+                  ) : (
+                    /* Device grid — one tile per registered device */
+                    <div className={`grid gap-2 mb-4 ${registeredDevices.length === 1 ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2"}`}>
+                      {registeredDevices.map(d => {
+                        const isConn = d.status?.connected;
+                        const isBusy = deviceBusy.has(d.id);
+                        return (
+                          <div key={d.id}
+                            className={`rounded-xl border px-3 py-2.5 flex items-center gap-3 transition
+                              ${isConn ? "border-emerald-500/30 bg-emerald-500/5" : "border-slate-800 bg-slate-800/30"}`}>
+                            {/* Status dot */}
+                            <div className={`h-2.5 w-2.5 shrink-0 rounded-full
+                              ${isBusy ? "bg-amber-400 animate-pulse"
+                                : isConn ? "bg-emerald-400 animate-pulse"
+                                : "bg-slate-600"}`} />
+                            {/* Info */}
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-xs font-semibold text-white truncate">{d.name}</span>
+                                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full shrink-0
+                                  ${isConn ? "bg-emerald-500/20 text-emerald-300" : "bg-slate-700/80 text-slate-500"}`}>
+                                  {isBusy ? "…" : isConn ? "Online" : "Offline"}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1.5 mt-0.5">
+                                <span className="text-[10px] font-mono text-cyan-400/80">{d.ipAddress}</span>
+                                {d.location && <span className="text-[10px] text-slate-600 truncate">· {d.location}</span>}
+                              </div>
+                              {!isConn && d.status?.error && (
+                                <p className="text-[9px] text-red-400 truncate mt-0.5" title={d.status.error}>
+                                  {d.status.error.split(':')[0]}
+                                </p>
+                              )}
+                            </div>
+                            {/* Connect / Disconnect button */}
+                            <button disabled={isBusy}
+                              onClick={async () => {
+                                setDeviceBusy(prev => new Set(prev).add(d.id));
+                                try {
+                                  const ep = isConn ? "disconnect" : "connect";
+                                  const r = await fetch(`${API_BASE}/api/devices-config/${d.id}/${ep}`, { method: "POST" });
+                                  const res = await r.json();
+                                  if (!isConn && res.connected) toast.success(`Connected to ${d.ipAddress}`);
+                                  else if (!isConn) toast.error(`Cannot reach ${d.ipAddress}`);
+                                  else toast.success(`Disconnected ${d.name}`);
+                                  await loadRegisteredDevices();
+                                } catch { toast.error("Request failed"); }
+                                setDeviceBusy(prev => { const s = new Set(prev); s.delete(d.id); return s; });
+                              }}
+                              title={isConn ? "Disconnect" : "Connect"}
+                              className={`rounded-lg p-1.5 transition disabled:opacity-40 shrink-0
+                                ${isConn
+                                  ? "text-emerald-400 hover:bg-red-500/15 hover:text-red-400"
+                                  : "text-slate-500 hover:bg-cyan-500/15 hover:text-cyan-400"}`}>
+                              {isBusy
+                                ? <FiLoader className="text-sm animate-spin" />
+                                : isConn ? <FiWifiOff className="text-sm" /> : <FiWifi className="text-sm" />}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Action buttons for active connection */}
                   <div className="grid grid-cols-3 gap-2">
                     <button onClick={pullUsers} disabled={busy || !connected} className="secondary-action py-2.5 text-xs text-center touch-manipulation flex flex-col items-center gap-0.5">
                       <FiUsers className="text-sm" /><span>Get Users</span>
@@ -900,6 +1112,7 @@ export default function SmartAttendanceDashboard() {
                       <FiDownloadCloud className="text-sm" /><span>Pull Logs</span>
                     </button>
                   </div>
+
                   {/* Device users quick list */}
                   {deviceUsers.length > 0 && (
                     <div className="mt-4 border-t border-slate-800 pt-3">
@@ -1037,6 +1250,58 @@ export default function SmartAttendanceDashboard() {
         </div>
       )}
 
+      {/* ══ DEV AUTH GATE MODAL ══════════════════════════════
+           Lightweight inline password prompt for all device-data
+           operations (push, pull, register, delete, sync, clear).
+           Separate from the full Developer Settings modal.
+      ════════════════════════════════════════════════════════ */}
+      {devAuthOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl border border-amber-500/30 bg-slate-900 p-6 shadow-2xl">
+            <div className="flex items-center gap-3 mb-5">
+              <div className="rounded-xl bg-amber-500/15 p-2.5 text-amber-400 shrink-0">
+                <FiLock className="text-lg" />
+              </div>
+              <div>
+                <h2 className="text-base font-bold text-white">Developer Password</h2>
+                <p className="text-xs text-slate-500 mt-0.5">Required for all device data operations</p>
+              </div>
+            </div>
+            <form onSubmit={submitDevAuth} className="space-y-4">
+              <div className="relative">
+                <input
+                  autoFocus
+                  type={devAuthShowPw ? "text" : "password"}
+                  value={devAuthPassword}
+                  onChange={e => { setDevAuthPassword(e.target.value); setDevAuthError(""); }}
+                  placeholder="Enter developer password"
+                  className="form-field pr-10 w-full"
+                />
+                <button type="button" onClick={() => setDevAuthShowPw(v => !v)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white transition">
+                  {devAuthShowPw ? <FiEyeOff /> : <FiEye />}
+                </button>
+              </div>
+              {devAuthError && (
+                <p className="text-sm text-red-400 flex items-center gap-1.5">
+                  <FiAlertTriangle className="shrink-0" /> {devAuthError}
+                </p>
+              )}
+              <div className="flex gap-2">
+                <button type="submit" disabled={devAuthBusy || !devAuthPassword}
+                  className="primary-action flex-1 py-2.5 text-sm disabled:opacity-50">
+                  {devAuthBusy ? "Verifying…" : "Confirm"}
+                </button>
+                <button type="button" onClick={() => { setDevAuthOpen(false); devAuthPendingRef.current = null; }}
+                  className="secondary-action flex-1 py-2.5 text-sm">
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* ══ DEV PASSWORD MODAL ═══════════════════════════════ */}
       {devStep === "password" && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
@@ -1071,74 +1336,190 @@ export default function SmartAttendanceDashboard() {
 
       {/* ══ DEV SETTINGS MODAL ═══════════════════════════════ */}
       {devStep === "settings" && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm overflow-y-auto">
-          <div className="w-full max-w-lg rounded-2xl border border-slate-700 bg-slate-900 p-8 shadow-2xl my-4">
-            <div className="mb-6 flex items-center justify-between">
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 p-4 backdrop-blur-sm overflow-y-auto">
+          <div className="w-full max-w-2xl rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl my-4">
+
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
               <div className="flex items-center gap-3">
-                <div className="rounded-xl bg-amber-500/15 p-3 text-amber-400"><FiSettings className="text-xl" /></div>
+                <div className="rounded-xl bg-amber-500/15 p-2.5 text-amber-400"><FiSettings className="text-lg" /></div>
                 <div>
-                  <h2 className="text-xl font-bold">Device Configuration</h2>
-                  <p className="text-sm text-slate-400">Saved instantly — no restart needed</p>
+                  <h2 className="text-lg font-bold">Developer Settings</h2>
+                  <p className="text-xs text-slate-500">Devices · Server · Connection</p>
                 </div>
               </div>
-              <button onClick={closeDevModal} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white"><FiX /></button>
+              <button onClick={closeDevModal} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white transition"><FiX /></button>
             </div>
-            <form onSubmit={saveDevSettings} className="space-y-5">
-              <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3">
-                <p className="text-xs text-amber-300 font-medium flex items-center gap-1.5">
-                  <FiAlertTriangle className="shrink-0" />
-                  Set the FK623 IP to its actual address on this tablet's local network. Each tablet must point to its own FK623.
-                </p>
-              </div>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <div className="sm:col-span-2">
-                  <label className="mb-1.5 block text-sm font-medium text-slate-300">FK623 IP Address <span className="text-amber-400">*</span></label>
-                  <input required type="text" value={devForm.ipAddress} onChange={e => setDevForm({...devForm, ipAddress: e.target.value})} placeholder="192.168.1.76" className="form-field font-mono" />
-                  <p className="mt-1 text-[11px] text-slate-600">The FK623's IP on the local network. Run POST /api/device/scan to auto-discover.</p>
-                </div>
-                <div>
-                  <label className="mb-1.5 block text-sm text-slate-400">Port</label>
-                  <input type="number" value={devForm.port} onChange={e => setDevForm({...devForm, port: Number(e.target.value)})} className="form-field" />
-                </div>
-                <div>
-                  <label className="mb-1.5 block text-sm text-slate-400">License Number</label>
-                  <input type="number" value={devForm.license} onChange={e => setDevForm({...devForm, license: Number(e.target.value)})} className="form-field" />
-                </div>
-                <div className="sm:col-span-2">
-                  <label className="mb-1.5 block text-sm text-slate-400">Device ID (optional)</label>
-                  <input type="text" value={devForm.deviceId} onChange={e => setDevForm({...devForm, deviceId: e.target.value})} placeholder="Leave blank to auto-detect" className="form-field" />
-                </div>
-                <div className="sm:col-span-2 border-t border-slate-800 pt-4">
-                  <label className="mb-1.5 block text-sm font-medium text-amber-400">School Server URL</label>
-                  <input type="text" value={devForm.serverApiUrl ?? "https://backend.ecareafrica.net/api/v1"} onChange={e => setDevForm({...devForm, serverApiUrl: e.target.value})} placeholder="https://backend.ecareafrica.net/api/v1" className="form-field font-mono text-xs" />
-                  <p className="mt-1 text-[11px] text-slate-500">Change if the school server address changes. Takes effect immediately.</p>
-                </div>
-              </div>
-              {tabletLocation && (
-                <div className="rounded-xl border border-slate-700 bg-slate-800/40 px-4 py-3 flex items-center gap-3">
-                  <FiMapPin className="text-cyan-400 shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs text-slate-500">Location (from server registry)</p>
-                    <p className="text-sm text-slate-300 font-medium">{tabletLocation}</p>
+
+            <div className="p-6 space-y-6">
+
+              {/* ── SECTION 1: Registered Biometric Devices ────────── */}
+              <section>
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2"><FiCpu className="text-cyan-400" /> Biometric Devices</h3>
+                    <p className="text-[11px] text-slate-500 mt-0.5">Each FK623 device on the local network. Changes take effect immediately.</p>
                   </div>
+                  <button
+                    onClick={() => { setDevDeviceEditId(null); setDevDeviceForm({ name: "", ipAddress: "", port: 5005, license: 1261, location: "", notes: "" }); setDevDeviceFormOpen(true); }}
+                    className="flex items-center gap-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 px-3 py-1.5 text-xs font-semibold text-white transition">
+                    <FiPlus /> Add Device
+                  </button>
                 </div>
-              )}
-              {connected && device && (
-                <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-4">
-                  <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">Live Device Info</p>
-                  <div className="grid grid-cols-2 gap-3 text-sm">
-                    <div><p className="text-slate-500 text-xs">Serial</p><p className="font-medium text-slate-200">{device.serialNumber || "—"}</p></div>
-                    <div><p className="text-slate-500 text-xs">Model</p><p className="font-medium text-slate-200">{device.productName || device.productCode || "—"}</p></div>
-                    <div><p className="text-slate-500 text-xs">Users</p><p className="font-medium text-slate-200">{device.users ?? "—"}</p></div>
-                    <div><p className="text-slate-500 text-xs">Logs</p><p className="font-medium text-slate-200">{(device as any).logs ?? "—"}</p></div>
+
+                {/* Add / Edit inline form */}
+                {devDeviceFormOpen && (
+                  <div className="mb-3 rounded-xl border border-cyan-500/30 bg-cyan-500/5 p-4 space-y-3">
+                    <p className="text-xs font-semibold text-cyan-300">{devDeviceEditId ? "Edit Device" : "Add New Device"}</p>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="col-span-2">
+                        <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Name <span className="text-red-400">*</span></label>
+                        <input value={devDeviceForm.name} onChange={e => setDevDeviceForm(f => ({...f, name: e.target.value}))} placeholder="Main Gate FK623" className="form-field text-sm" />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">IP Address <span className="text-red-400">*</span></label>
+                        <input value={devDeviceForm.ipAddress} onChange={e => setDevDeviceForm(f => ({...f, ipAddress: e.target.value}))} placeholder="192.168.1.76" className="form-field text-sm font-mono" />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Port</label>
+                        <input type="number" value={devDeviceForm.port} onChange={e => setDevDeviceForm(f => ({...f, port: Number(e.target.value)}))} className="form-field text-sm" />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">License No.</label>
+                        <input type="number" value={devDeviceForm.license} onChange={e => setDevDeviceForm(f => ({...f, license: Number(e.target.value)}))} className="form-field text-sm" />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Location</label>
+                        <input value={devDeviceForm.location} onChange={e => setDevDeviceForm(f => ({...f, location: e.target.value}))} placeholder="e.g. Main Gate" className="form-field text-sm" />
+                      </div>
+                    </div>
+                    <div className="flex gap-2 pt-1">
+                      <button type="button" onClick={async () => {
+                        if (!devDeviceForm.name.trim() || !devDeviceForm.ipAddress.trim()) { toast.error("Name and IP are required"); return; }
+                        try {
+                          const url = devDeviceEditId
+                            ? `${API_BASE}/api/devices-config/${devDeviceEditId}`
+                            : `${API_BASE}/api/devices-config`;
+                          const r = await fetch(url, { method: devDeviceEditId ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(devDeviceForm) });
+                          const d = await r.json();
+                          if (!d.success) { toast.error(d.error || "Save failed"); return; }
+                          toast.success(devDeviceEditId ? `Updated ${devDeviceForm.name}` : `Added ${devDeviceForm.name}`);
+                          setDevDeviceFormOpen(false); setDevDeviceEditId(null);
+                          await loadRegisteredDevices();
+                          // If this is the first device, auto-set the IP in devForm too
+                          if (!devDeviceEditId && !devForm.ipAddress) {
+                            setDevForm(f => ({...f, ipAddress: devDeviceForm.ipAddress, port: devDeviceForm.port, license: devDeviceForm.license }));
+                          }
+                        } catch { toast.error("Network error"); }
+                      }} className="flex-1 rounded-xl bg-cyan-600 hover:bg-cyan-500 py-2 text-xs font-semibold text-white transition">
+                        {devDeviceEditId ? "Save Changes" : "Add Device"}
+                      </button>
+                      <button type="button" onClick={() => { setDevDeviceFormOpen(false); setDevDeviceEditId(null); }} className="flex-1 rounded-xl border border-slate-700 py-2 text-xs text-slate-400 hover:text-white transition">Cancel</button>
+                    </div>
                   </div>
-                </div>
-              )}
-              <div className="flex gap-3">
-                <button type="submit" className="primary-action flex-1 py-3">Save &amp; Reconnect</button>
-                <button type="button" onClick={closeDevModal} className="secondary-action flex-1 py-3">Cancel</button>
-              </div>
-            </form>
+                )}
+
+                {/* Device list */}
+                {registeredDevices.length === 0 ? (
+                  <div className="rounded-xl border border-slate-800 bg-slate-800/30 py-6 text-center">
+                    <FiCpu className="mx-auto text-2xl text-slate-700 mb-1.5" />
+                    <p className="text-xs text-slate-500">No devices added yet. Click <strong className="text-slate-400">Add Device</strong> to register your FK623.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {registeredDevices.map(d => {
+                      const isBusy = deviceBusy.has(d.id);
+                      const isConn = d.status?.connected;
+                      return (
+                        <div key={d.id} className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 transition ${isConn ? "border-emerald-500/30 bg-emerald-500/5" : "border-slate-800 bg-slate-800/30"}`}>
+                          {/* Status dot */}
+                          <div className={`h-2 w-2 shrink-0 rounded-full ${isBusy ? "bg-amber-400 animate-pulse" : isConn ? "bg-emerald-400 animate-pulse" : "bg-slate-600"}`} />
+                          {/* Info */}
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-semibold text-white truncate">{d.name}</span>
+                              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${isConn ? "bg-emerald-500/20 text-emerald-300" : "bg-slate-700 text-slate-500"}`}>
+                                {isBusy ? "..." : isConn ? "Online" : "Offline"}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2 mt-0.5">
+                              <span className="text-[11px] font-mono text-cyan-400">{d.ipAddress}:{d.port}</span>
+                              {d.location && <span className="text-[11px] text-slate-500">· {d.location}</span>}
+                              {d.status?.error && !isConn && <span className="text-[10px] text-red-400 truncate max-w-[140px]" title={d.status.error}>· {d.status.error.split(':')[0]}</span>}
+                            </div>
+                          </div>
+                          {/* Actions */}
+                          <div className="flex items-center gap-1 shrink-0">
+                            {/* Connect / Disconnect */}
+                            <button disabled={isBusy} title={isConn ? "Disconnect" : "Connect"}
+                              onClick={async () => {
+                                setDeviceBusy(prev => new Set(prev).add(d.id));
+                                try {
+                                  const endpoint = isConn ? "disconnect" : "connect";
+                                  const r = await fetch(`${API_BASE}/api/devices-config/${d.id}/${endpoint}`, { method: "POST" });
+                                  const res = await r.json();
+                                  if (!isConn && res.connected) toast.success(`Connected to ${d.ipAddress}`);
+                                  else if (!isConn && !res.connected) toast.error(`Cannot reach ${d.ipAddress}: ${res.error || "unreachable"}`);
+                                  else toast.success(`Disconnected ${d.name}`);
+                                  await loadRegisteredDevices();
+                                } catch { toast.error("Request failed"); }
+                                setDeviceBusy(prev => { const s = new Set(prev); s.delete(d.id); return s; });
+                              }}
+                              className={`rounded-lg p-1.5 transition disabled:opacity-40 ${isConn ? "text-emerald-400 hover:bg-red-500/15 hover:text-red-400" : "text-slate-500 hover:bg-cyan-500/15 hover:text-cyan-400"}`}>
+                              {isConn ? <FiWifiOff className="text-sm" /> : <FiWifi className="text-sm" />}
+                            </button>
+                            {/* Edit */}
+                            <button title="Edit" onClick={() => {
+                              setDevDeviceEditId(d.id);
+                              setDevDeviceForm({ name: d.name, ipAddress: d.ipAddress, port: d.port, license: d.license, location: d.location, notes: d.notes || "" });
+                              setDevDeviceFormOpen(true);
+                            }} className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-700 hover:text-white transition">
+                              <FiEdit2 className="text-sm" />
+                            </button>
+                            {/* Delete */}
+                            <button title="Delete" onClick={async () => {
+                              if (!confirm(`Remove "${d.name}"?`)) return;
+                              try {
+                                await fetch(`${API_BASE}/api/devices-config/${d.id}`, { method: "DELETE" });
+                                toast.success(`Removed ${d.name}`);
+                                await loadRegisteredDevices();
+                              } catch { toast.error("Delete failed"); }
+                            }} className="rounded-lg p-1.5 text-slate-500 hover:bg-red-500/15 hover:text-red-400 transition">
+                              <FiTrash2 className="text-sm" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+
+              {/* ── SECTION 2: School Server URL ───────────────────── */}
+              <section className="border-t border-slate-800 pt-5">
+                <h3 className="text-sm font-bold text-white mb-3 flex items-center gap-2"><FiServer className="text-slate-400" /> School Server</h3>
+                <form onSubmit={saveDevSettings} className="space-y-3">
+                  <div>
+                    <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Server API URL</label>
+                    <input type="text" value={devForm.serverApiUrl ?? "https://backend.ecareafrica.net/api/v1"} onChange={e => setDevForm({...devForm, serverApiUrl: e.target.value})} placeholder="https://backend.ecareafrica.net/api/v1" className="form-field font-mono text-xs" />
+                    <p className="mt-1 text-[11px] text-slate-600">Change only if the school server address changes. Takes effect immediately.</p>
+                  </div>
+                  {/* Hidden fields to satisfy saveDevSettings — use first registered device IP or existing */}
+                  <input type="hidden" value={devForm.ipAddress} readOnly />
+                  {tabletLocation && (
+                    <div className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800/40 px-3 py-2">
+                      <FiMapPin className="text-cyan-400 text-xs shrink-0" />
+                      <span className="text-xs text-slate-400">Location: <strong className="text-slate-200">{tabletLocation}</strong></span>
+                    </div>
+                  )}
+                  <div className="flex gap-2 pt-1">
+                    <button type="submit" className="primary-action flex-1 py-2.5 text-sm">Save Server URL</button>
+                    <button type="button" onClick={closeDevModal} className="secondary-action flex-1 py-2.5 text-sm">Close</button>
+                  </div>
+                </form>
+              </section>
+
+            </div>
           </div>
         </div>
       )}

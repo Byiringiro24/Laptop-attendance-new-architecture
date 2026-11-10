@@ -1053,6 +1053,29 @@ function apiResult(res, result, successStatus = 200) {
   return res.status(successStatus).json(result);
 }
 
+// ── Middleware: verify developer password on destructive device operations ────
+// Pass ?devPassword=<pw> in the request body or header X-Dev-Password.
+// Returns 401 if the password is wrong. Skip check in FAKE_BRIDGE mode (testing).
+function requireDevPassword(req, res, next) {
+  if (process.env.FAKE_BRIDGE === '1') return next(); // bypass in test mode
+  const supplied = req.body?.devPassword || req.headers['x-dev-password'] || '';
+  if (!supplied) {
+    return res.status(401).json({ success: false, error: 'Developer password required', code: 'dev_password_required' });
+  }
+  if (String(supplied).trim() !== String(DEV_PASSWORD).trim()) {
+    return res.status(401).json({ success: false, error: 'Incorrect developer password', code: 'dev_password_incorrect' });
+  }
+  next();
+}
+
+// ── Helper: is the error a device-not-connected error? ────────────────────────
+function isNotConnectedError(err = '') {
+  const s = String(err).toLowerCase();
+  return s.includes('not connected') || s.includes('not reachable') ||
+         s.includes('-3') || s.includes('timeout') || s.includes('bridge stopped') ||
+         s.includes('no device') || s.includes('device offline');
+}
+
 function backupToMethod(backupNumber) {
   if (backupNumber >= 0 && backupNumber <= 9) return 'Fingerprint';
   if (backupNumber === 10) return 'Password/PIN';
@@ -1129,6 +1152,9 @@ function normalizeStudent(input) {
     roomName,
     dormitoryName,
     assignedDeviceId: input.assignedDeviceId || currentDevice?.deviceId || '',
+    // Which FK623 device this student was registered on — used for per-device filtering
+    registeredOnDevice: input.registeredOnDevice || activeDeviceConfig?.ipAddress || currentDevice?.ipAddress || '',
+    registeredOnDeviceName: input.registeredOnDeviceName || activeDeviceConfig?.name || '',
     parentName: input.parentName || '',
     parentPhone: input.parentPhone || input.parent_phone || '',
     phone: input.phone || '',
@@ -1892,7 +1918,10 @@ app.post('/api/device/disconnect-session', (req, res) => {
   });
 });
 
-app.post('/api/device/sync-time', async (req, res) => apiResult(res, await sendCommand('SYNC_TIME')));
+app.post('/api/device/sync-time', requireDevPassword, async (req, res) => {
+  if (!currentDevice || !currentDevice.connected) return res.status(503).json({ success: false, error: 'Device is not connected', code: 'device_not_connected' });
+  apiResult(res, await sendCommand('SYNC_TIME'));
+});
 
 app.post('/api/device/set-time', async (req, res) => {
   const timestamp = req.body?.timestamp;
@@ -1900,7 +1929,12 @@ app.post('/api/device/set-time', async (req, res) => {
   apiResult(res, await sendCommand(`SET_TIME|${timestamp}`));
 });
 
-app.get('/api/device/users', async (req, res) => apiResult(res, await refreshUsersCache()));
+app.get('/api/device/users', requireDevPassword, async (req, res) => {
+  if (!currentDevice || !currentDevice.connected) {
+    return res.status(503).json({ success: false, error: 'Device is not connected', code: 'device_not_connected' });
+  }
+  apiResult(res, await refreshUsersCache());
+});
 
 app.post('/api/device/users', async (req, res) => {
   const userId = String(req.body?.userId || req.body?.studentDeviceId || req.body?.studentId || '').trim();
@@ -1949,7 +1983,8 @@ app.delete('/api/device/users/:id', async (req, res) => {
   apiResult(res, result);
 });
 
-app.post('/api/device/pull-logs', async (req, res) => {
+app.post('/api/device/pull-logs', requireDevPassword, async (req, res) => {
+  if (!currentDevice || !currentDevice.connected) return res.status(503).json({ success: false, error: 'Device is not connected', code: 'device_not_connected' });
   const readMark = req.body?.readMark === 1 || req.query.readMark === '1' ? 1 : 0;
   let result = await sendCommand(`GET_LOGS|${readMark}`, 90000);
   if (result.success && (result.data?.logs || []).length === 0 && readMark === 1) {
@@ -1958,20 +1993,37 @@ app.post('/api/device/pull-logs', async (req, res) => {
   if (result.success) {
     const newLogs = Array.isArray(result.data?.logs) ? result.data.logs : [];
     logsCache = newLogs;
-    // Seed seen IDs so auto-poll doesn't re-fire these as new
     newLogs.map(attendanceFromLog).forEach((l) => seenLogIds.add(l.id));
+  } else if (isNotConnectedError(result.error)) {
+    currentDevice = null;
+    sseEmit('deviceStatus', { connected: false, error: result.error, source: 'pull-logs' });
+    return res.status(503).json({ ...result, code: 'device_not_connected' });
   }
   apiResult(res, result);
 });
 
-app.post('/api/device/push-students', async (req, res) => {
+app.post('/api/device/push-students', requireDevPassword, async (req, res) => {
+  // Check device is actually connected before attempting
+  if (!currentDevice || !currentDevice.connected) {
+    return res.status(503).json({ success: false, error: 'Device is not connected. Connect the FK623 device first.', code: 'device_not_connected' });
+  }
   const ids = Array.isArray(req.body?.studentIds) ? req.body.studentIds : [];
   const selected = ids.length ? students.filter((student) => ids.includes(student.studentId)) : students;
   const pushed = [];
   const failed = [];
   for (const student of selected) {
     const result = await sendCommand(`ADD_USER|${student.studentDeviceId}|${String(student.name).replace(/\|/g, ' ')}`, 30000);
-    if (result.success) pushed.push(student); else failed.push({ student, error: result.error, code: result.code });
+    if (result.success) pushed.push(student);
+    else {
+      const code = isNotConnectedError(result.error) ? 'device_not_connected' : 'push_failed';
+      failed.push({ student, error: result.error, code });
+      // If device disconnected mid-push, stop trying
+      if (code === 'device_not_connected') {
+        currentDevice = null;
+        sseEmit('deviceStatus', { connected: false, error: result.error, source: 'push-students' });
+        break;
+      }
+    }
   }
   if (pushed.length) await refreshUsersCache().catch(() => null);
 
@@ -2000,12 +2052,26 @@ app.post('/api/device/push-students', async (req, res) => {
     }
   }
 
-  res.json({ success: failed.length === 0, data: { pushed: pushed.length, failed: failed.length, failures: failed }, error: failed[0]?.error || null });
+  res.json({
+    success: failed.length === 0,
+    data: { pushed: pushed.length, failed: failed.length, failures: failed },
+    error: failed[0]?.error || null,
+    code: failed.length > 0 && failed.every(f => f.code === 'device_not_connected') ? 'device_not_connected' : null,
+  });
 });
 
-app.post('/api/device/clear-logs', async (req, res) => apiResult(res, await sendCommand('CLEAR_LOGS')));
-app.post('/api/device/clear-all', async (req, res) => apiResult(res, await sendCommand('CLEAR_ALL')));
-app.post('/api/device/poweroff', async (req, res) => apiResult(res, await sendCommand('POWEROFF')));
+app.post('/api/device/clear-logs', requireDevPassword, async (req, res) => {
+  if (!currentDevice || !currentDevice.connected) return res.status(503).json({ success: false, error: 'Device is not connected', code: 'device_not_connected' });
+  apiResult(res, await sendCommand('CLEAR_LOGS'));
+});
+app.post('/api/device/clear-all', requireDevPassword, async (req, res) => {
+  if (!currentDevice || !currentDevice.connected) return res.status(503).json({ success: false, error: 'Device is not connected', code: 'device_not_connected' });
+  apiResult(res, await sendCommand('CLEAR_ALL'));
+});
+app.post('/api/device/poweroff', requireDevPassword, async (req, res) => {
+  if (!currentDevice || !currentDevice.connected) return res.status(503).json({ success: false, error: 'Device is not connected', code: 'device_not_connected' });
+  apiResult(res, await sendCommand('POWEROFF'));
+});
 
 app.get('/api/dashboard/stats', async (req, res) => {
   if (!currentDevice) {
@@ -2017,16 +2083,34 @@ app.get('/api/dashboard/stats', async (req, res) => {
   const lateCount = todayLogs
     .map(attendanceFromLog)
     .filter((log) => String(log.status).toLowerCase().includes('late')).length;
+
+  // Per-device student counts using the devices list
+  const devicesList = loadDevicesList();
+  const perDevice = devicesList.map(d => ({
+    id:        d.id,
+    name:      d.name,
+    ipAddress: d.ipAddress,
+    location:  d.location,
+    connected: !!(deviceStatusMap.get(d.id)?.connected),
+    studentCount: students.filter(s =>
+      s.registeredOnDevice === d.ipAddress ||
+      s.assignedDeviceId   === d.ipAddress
+    ).length,
+  }));
+
   res.json({
     success: true,
     stats: {
       totalStudents: students.length || usersCache.length,
-      totalDevices: currentDevice ? 1 : 0,
-      onlineDevices: currentDevice?.connected ? 1 : 0,
+      totalDevices: devicesList.length || (currentDevice ? 1 : 0),
+      onlineDevices: devicesList.length
+        ? devicesList.filter(d => deviceStatusMap.get(d.id)?.connected).length
+        : (currentDevice?.connected ? 1 : 0),
       attendanceToday: new Set(todayLogs.map((log) => log.userId)).size,
       lateStudents: lateCount,
       totalLogs: logsCache.length,
     },
+    perDevice,
   });
 });
 
@@ -2035,18 +2119,62 @@ app.get('/api/dashboard/recent', (req, res) => {
 });
 
 app.get('/api/students', async (req, res) => {
-  const merged = students.map((student) => {
+  // Filters: ?deviceId=192.168.1.x  ?date=2026-11-09  ?search=name  ?class=S1
+  const { deviceId, date, search, class: classFilter } = req.query || {};
+
+  let merged = students.map((student) => {
     const deviceUser = usersCache.find((user) => user.userId === student.studentDeviceId);
     return { ...student, deviceUser, biometricMethods: deviceUser?.biometricMethods || [] };
   });
-  res.json({ success: true, students: merged, count: merged.length });
+
+  // Filter by device (IP address stored in registeredOnDevice)
+  if (deviceId && String(deviceId).trim()) {
+    const dId = String(deviceId).trim();
+    merged = merged.filter(s =>
+      s.registeredOnDevice === dId ||
+      s.assignedDeviceId === dId ||
+      s.studentDeviceId === dId
+    );
+  }
+
+  // Filter by registration date (createdAt)
+  if (date && String(date).trim()) {
+    const targetDate = String(date).trim(); // expected: YYYY-MM-DD
+    merged = merged.filter(s => {
+      if (!s.createdAt) return false;
+      return s.createdAt.slice(0, 10) === targetDate;
+    });
+  }
+
+  // Filter by name / studentId search
+  if (search && String(search).trim()) {
+    const q = String(search).trim().toLowerCase();
+    merged = merged.filter(s =>
+      (s.name || '').toLowerCase().includes(q) ||
+      (s.studentId || '').toLowerCase().includes(q) ||
+      (s.studentDeviceId || '').toLowerCase().includes(q)
+    );
+  }
+
+  // Filter by class
+  if (classFilter && String(classFilter).trim() !== 'all') {
+    const cls = String(classFilter).trim();
+    merged = merged.filter(s => (s.className || '') === cls);
+  }
+
+  res.json({ success: true, students: merged, count: merged.length, total: students.length });
 });
 
-app.post('/api/students', async (req, res) => {
+app.post('/api/students', requireDevPassword, async (req, res) => {
   const student = normalizeStudent(req.body);
   if (!student.name) return res.status(400).json({ success: false, error: 'Student full name is required' });
   if (!student.studentDeviceId) return res.status(400).json({ success: false, error: 'Student device ID is required' });
   if (!student.studentId.startsWith('RW-')) return res.status(400).json({ success: false, error: 'Student ID must start with Rwanda suffix RW-, for example RW-0001' });
+
+  // Stamp which device this student was registered on (IP + name from config)
+  if (!student.registeredOnDevice && activeDeviceConfig?.ipAddress) {
+    student.registeredOnDevice = activeDeviceConfig.ipAddress;
+  }
 
   const existingIndex = students.findIndex((item) => item.studentId === student.studentId || item.studentDeviceId === student.studentDeviceId);
   if (existingIndex >= 0) students[existingIndex] = { ...students[existingIndex], ...student, updatedAt: new Date().toISOString() };
@@ -2054,22 +2182,65 @@ app.post('/api/students', async (req, res) => {
   saveStudents();
 
   let pushResult = null;
+  let pushCode = null;
   if (req.body.pushToDevice !== false) {
+    if (!currentDevice || !currentDevice.connected) {
+      // Save locally but tell frontend device is offline
+      return res.json({
+        success: true,
+        savedLocally: true,
+        pushResult: null,
+        student,
+        warning: 'Student saved locally. Device is not connected — push to device when device is online.',
+        code: 'device_not_connected',
+      });
+    }
     pushResult = await sendCommand(`ADD_USER|${student.studentDeviceId}|${String(student.name).replace(/\|/g, ' ')}`, 30000);
     await refreshUsersCache().catch(() => null);
+    if (!pushResult.success) {
+      pushCode = isNotConnectedError(pushResult.error) ? 'device_not_connected' : 'push_failed';
+      if (pushCode === 'device_not_connected') {
+        currentDevice = null;
+        sseEmit('deviceStatus', { connected: false, error: pushResult.error, source: 'register-student' });
+      }
+    }
   }
 
-  res.json({ success: !pushResult || pushResult.success, student, pushResult, error: pushResult?.success === false ? pushResult.error : null });
+  res.json({
+    success: !pushResult || pushResult.success,
+    savedLocally: true,
+    student,
+    pushResult,
+    code: pushCode,
+    error: pushResult?.success === false ? pushResult.error : null,
+  });
 });
 
-app.delete('/api/students/:id', async (req, res) => {
+app.delete('/api/students/:id', requireDevPassword, async (req, res) => {
   const student = students.find((item) => item.studentId === req.params.id || item.studentDeviceId === req.params.id);
   const deviceId = student?.studentDeviceId || req.params.id;
-  const result = await sendCommand(`DELETE_USER|${deviceId}`);
+
+  // Always remove from local list first
   students = students.filter((item) => item.studentId !== req.params.id && item.studentDeviceId !== req.params.id);
   saveStudents();
-  if (result.success) usersCache = usersCache.filter((user) => user.userId !== deviceId);
-  apiResult(res, result);
+
+  // Try to remove from device — not fatal if device is offline
+  if (currentDevice && currentDevice.connected) {
+    const result = await sendCommand(`DELETE_USER|${deviceId}`);
+    if (result.success) {
+      usersCache = usersCache.filter((user) => user.userId !== deviceId);
+      return res.json({ success: true, removedFromDevice: true });
+    } else {
+      const code = isNotConnectedError(result.error) ? 'device_not_connected' : 'delete_failed';
+      if (code === 'device_not_connected') {
+        currentDevice = null;
+        sseEmit('deviceStatus', { connected: false, error: result.error, source: 'delete-student' });
+      }
+      return res.json({ success: true, removedLocally: true, removedFromDevice: false, deviceError: result.error, code });
+    }
+  }
+  // Device offline — removed locally only
+  res.json({ success: true, removedLocally: true, removedFromDevice: false, code: 'device_not_connected' });
 });
 
 app.get('/api/devices', (req, res) => {

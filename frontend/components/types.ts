@@ -11,6 +11,15 @@ export type Stats = {
   totalLogs: number;
 };
 
+export type PerDeviceStat = {
+  id: string;
+  name: string;
+  ipAddress: string;
+  location: string;
+  connected: boolean;
+  studentCount: number;
+};
+
 export type DeviceStatus = {
   connected?: boolean;
   deviceId?: string;
@@ -55,6 +64,11 @@ export type Student = {
   className: string;
   section?: string;
   assignedDeviceId?: string;
+  registeredOnDevice?: string;
+  registeredOnDeviceName?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  parentPhone?: string;
   biometricMethods?: string[];
   deviceUser?: DeviceUser;
 };
