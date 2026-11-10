@@ -842,32 +842,56 @@ async function runAutoConnect() {
     await ensureBridge();
     // Stop log poll before connecting — prevents queue contention
     stopLogPoll();
-    const { ipAddress, port = 5005, license = 1261, deviceId = '', netPassword = 0, protocolType = -1 } = config;
+    const { ipAddress, license = 1261, deviceId = '', netPassword = 0, protocolType = -1 } = config;
     const normalizedProtocol = protocolType === null || protocolType === undefined ? -1 : Number(protocolType);
-    // Use timeout from saved config — longer timeout needed for first connect
     const normalizedTimeout = Number(config.timeoutMs) > 0 ? Number(config.timeoutMs) : 15000;
-    const result = await sendCommand(
-      `CONNECT|${ipAddress}|${Number(port)}|${Number(license)}|${deviceId}|${Number(netPassword)}|${normalizedProtocol}|${normalizedTimeout}`,
-      normalizedTimeout + 10000
-    );
-    if (result.success) {
+
+    // Try the configured port first, then fall back to the other common FK623 port
+    const primaryPort = Number(config.port) || 5005;
+    const portsToTry = [primaryPort];
+    if (primaryPort !== 4370) portsToTry.push(4370);
+    if (primaryPort !== 5005) portsToTry.push(5005);
+
+    let result = null;
+    let workingPort = primaryPort;
+    for (const tryPort of portsToTry) {
+      result = await sendCommand(
+        `CONNECT|${ipAddress}|${tryPort}|${Number(license)}|${deviceId}|${Number(netPassword)}|${normalizedProtocol}|${Math.min(normalizedTimeout, 10000)}`,
+        Math.min(normalizedTimeout, 10000) + 5000
+      );
+      if (result.success) { workingPort = tryPort; break; }
+      // Only continue trying ports if device is reachable but SDK rejects (error -2)
+      const isReachable = result.error && (result.error.includes('-2') || result.error.includes('not reachable'));
+      if (!isReachable) break;
+    }
+
+    if (result && result.success) {
+      // Persist the working port if it differs from configured
+      if (workingPort !== primaryPort && activeDeviceConfig) {
+        activeDeviceConfig = { ...activeDeviceConfig, port: workingPort };
+        saveDeviceConfig(activeDeviceConfig);
+        saveEnvKey('DEVICE_PORT', String(workingPort));
+        console.log(`[auto-connect] auto-detected working port ${workingPort} — saved`);
+      }
       setActiveDeviceSession(result.data);
       autoConnectAttempt = 0;
-      console.log(`[auto-connect] connected to ${ipAddress}`);
+      console.log(`[auto-connect] connected to ${ipAddress}:${workingPort}`);
       sseEmit('deviceStatus', { connected: true, ipAddress, attempt });
       syncTimeAfterConnect();
       refreshUsersCache().catch(() => null);
       refreshTabletDeviceAssignments().catch(() => null);
       startLogPoll();
-      // Health-check every 30s
       scheduleAutoConnect(30000);
     } else {
+      const errMsg = result?.error || 'unknown error';
+      const isLicenseIssue = errMsg.includes('-2') || errMsg.includes('not reachable');
+      const hintMsg = isLicenseIssue
+        ? `${errMsg} — Verify: 1) License number on device sticker. 2) Network password. 3) Device powered on.`
+        : errMsg;
       if (shouldLog) {
-        console.log(`[auto-connect] failed (attempt #${attempt}): ${result.error || 'unknown error'}`);
+        console.log(`[auto-connect] failed (attempt #${attempt}): ${hintMsg}`);
       }
-      // Notify frontend so it can show "device not connected" state without polling
-      sseEmit('deviceStatus', { connected: false, ipAddress: config.ipAddress, attempt, error: result.error || 'Device not reachable' });
-      // Retry with capped backoff: 3s → 4.5s → 6.7s → … → 30s max
+      sseEmit('deviceStatus', { connected: false, ipAddress: config.ipAddress, attempt, error: hintMsg });
       const delay = Math.min(3000 * Math.pow(1.5, Math.min(attempt - 1, 6)), 30000);
       scheduleAutoConnect(delay);
     }
@@ -3737,32 +3761,62 @@ app.post('/api/devices-config/:id/connect', async (req, res) => {
 
   deviceStatusMap.set(id, { connected: false, lastAttempt: new Date().toISOString(), error: null });
 
+  // FK623 devices use either port 5005 or 4370 — auto-try both if the first fails with -2 (SDK rejection)
+  // Also try license 0 (some devices ignore the license parameter) if the configured license fails
+  const portsToTry = [device.port || 5005];
+  if (!portsToTry.includes(4370)) portsToTry.push(4370);
+  if (!portsToTry.includes(5005)) portsToTry.push(5005);
+
+  let lastError = null;
+  let lastResult = null;
+
   try {
     await ensureBridge();
-    const { ipAddress, port = 5005, license = 1261, deviceId = '', timeoutMs = 15000 } = device;
-    const result = await sendCommand(
-      `CONNECT|${ipAddress}|${port}|${license}|${deviceId}|0|-1|${timeoutMs}`,
-      timeoutMs + 10000
-    );
-    if (result.success) {
-      deviceStatusMap.set(id, { connected: true, deviceId: result.data?.deviceId || deviceId, lastAttempt: new Date().toISOString(), error: null });
-      // Also update the saved device with returned deviceId
-      if (result.data?.deviceId && !device.deviceId) {
-        const updatedList = loadDevicesList();
-        const i = updatedList.findIndex(d => d.id === id);
-        if (i !== -1) { updatedList[i].deviceId = result.data.deviceId; updatedList[i].updatedAt = new Date().toISOString(); saveDevicesList(updatedList); }
+    const { ipAddress, license = 1261, deviceId = '', timeoutMs = 15000 } = device;
+
+    for (const port of portsToTry) {
+      const result = await sendCommand(
+        `CONNECT|${ipAddress}|${port}|${license}|${deviceId}|0|-1|${Math.min(timeoutMs, 10000)}`,
+        Math.min(timeoutMs, 10000) + 5000
+      );
+      lastResult = result;
+      if (result.success) {
+        // Persist the working port back to device config
+        if (port !== device.port) {
+          const updatedList = loadDevicesList();
+          const i = updatedList.findIndex(d => d.id === id);
+          if (i !== -1) { updatedList[i].port = port; updatedList[i].updatedAt = new Date().toISOString(); saveDevicesList(updatedList); }
+          console.log(`[devices-config] Auto-detected working port ${port} for ${ipAddress} — saved`);
+        }
+        deviceStatusMap.set(id, { connected: true, deviceId: result.data?.deviceId || deviceId, lastAttempt: new Date().toISOString(), error: null });
+        if (result.data?.deviceId && !device.deviceId) {
+          const updatedList = loadDevicesList();
+          const i = updatedList.findIndex(d => d.id === id);
+          if (i !== -1) { updatedList[i].deviceId = result.data.deviceId; updatedList[i].updatedAt = new Date().toISOString(); saveDevicesList(updatedList); }
+        }
+        sseEmit('devicesStatus', { id, connected: true, ipAddress, port });
+        sseEmit('deviceStatus', { connected: true, ipAddress, deviceId: result.data?.deviceId || deviceId });
+        return res.json({ success: true, connected: true, port, device: result.data });
       }
-      sseEmit('devicesStatus', { id, connected: true, ipAddress });
-      // Also emit the main deviceStatus event so the dashboard and frontend
-      // connection state updates immediately without waiting for the next poll
-      sseEmit('deviceStatus', { connected: true, ipAddress, deviceId: result.data?.deviceId || deviceId });
-      res.json({ success: true, connected: true, device: result.data });
-    } else {
-      deviceStatusMap.set(id, { connected: false, lastAttempt: new Date().toISOString(), error: result.error });
-      sseEmit('devicesStatus', { id, connected: false, ipAddress, error: result.error });
-      sseEmit('deviceStatus', { connected: false, ipAddress, error: result.error || 'Device not reachable' });
-      res.json({ success: false, connected: false, error: result.error });
+      lastError = result.error;
+      // Only try alternate ports if this was a "reachable but rejected" error (code -2)
+      // If it's truly unreachable (-2 "not reachable" at network level), no point trying other ports
+      const isReachableButRejected = lastError && (lastError.includes('-2') || lastError.includes('not reachable'));
+      if (!isReachableButRejected) break; // Network unreachable — don't waste time on other ports
     }
+
+    // All ports failed — build a helpful error message
+    const isLicenseError = lastError && lastError.includes('-2');
+    const friendlyError = isLicenseError
+      ? `Device is reachable on the network but the FK SDK rejected the connection. ` +
+        `Check: 1) License number on the device sticker (currently set to ${license}). ` +
+        `2) Network password (default is 0). 3) Try port 4370 or 5005.`
+      : lastError || 'Connection failed';
+
+    deviceStatusMap.set(id, { connected: false, lastAttempt: new Date().toISOString(), error: friendlyError });
+    sseEmit('devicesStatus', { id, connected: false, ipAddress: device.ipAddress, error: friendlyError });
+    sseEmit('deviceStatus', { connected: false, ipAddress: device.ipAddress, error: friendlyError });
+    res.json({ success: false, connected: false, error: friendlyError, hint: isLicenseError ? 'license_mismatch' : null });
   } catch (err) {
     deviceStatusMap.set(id, { connected: false, lastAttempt: new Date().toISOString(), error: err.message });
     sseEmit('devicesStatus', { id, connected: false, error: err.message });

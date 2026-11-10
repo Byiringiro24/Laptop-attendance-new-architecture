@@ -2,8 +2,8 @@
   "name": "tablet-backend",
   "version": "1.0.0",
   "scripts": {
-    "start": "node api.js && node server.js",
-    "dev": "node api.js && node server.js"
+    "start": "node init && node server.js",
+    "dev": "node init && node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

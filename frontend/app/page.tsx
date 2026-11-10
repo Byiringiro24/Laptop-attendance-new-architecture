@@ -1066,7 +1066,9 @@ export default function SmartAttendanceDashboard() {
                               </div>
                               {!isConn && d.status?.error && (
                                 <p className="text-[9px] text-red-400 truncate mt-0.5" title={d.status.error}>
-                                  {d.status.error.split(':')[0]}
+                                  {d.status.error.includes('license_mismatch') || d.status.error.includes('sticker')
+                                    ? '⚠ Check license number on device sticker'
+                                    : d.status.error.split(':')[0]}
                                 </p>
                               )}
                             </div>
@@ -1382,11 +1384,17 @@ export default function SmartAttendanceDashboard() {
                       </div>
                       <div>
                         <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Port</label>
-                        <input type="number" value={devDeviceForm.port} onChange={e => setDevDeviceForm(f => ({...f, port: Number(e.target.value)}))} className="form-field text-sm" />
+                        <select value={devDeviceForm.port} onChange={e => setDevDeviceForm(f => ({...f, port: Number(e.target.value)}))} className="form-field text-sm">
+                          <option value={5005}>5005 (default)</option>
+                          <option value={4370}>4370 (ZKTeco)</option>
+                        </select>
                       </div>
                       <div>
-                        <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">License No.</label>
+                        <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                          License No. <span className="text-amber-400">*</span>
+                        </label>
                         <input type="number" value={devDeviceForm.license} onChange={e => setDevDeviceForm(f => ({...f, license: Number(e.target.value)}))} className="form-field text-sm" />
+                        <p className="mt-1 text-[10px] text-amber-400/80">Check the sticker on the physical device</p>
                       </div>
                       <div>
                         <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Location</label>
