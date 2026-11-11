@@ -2159,6 +2159,30 @@ app.post('/api/devices-config/:id/clear-logs', requireDevPassword, async (req, r
   res.json(result);
 });
 
+// ── POST /api/devices-config/:id/clear-all — delete ALL users + logs on a specific device ──
+// Each FK623 has its own user database — this only wipes the targeted device.
+app.post('/api/devices-config/:id/clear-all', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+  const result = await bridge.send('CLEAR_ALL', 60000);
+  if (!result.success && bridge._isOfflineError(result.error)) {
+    sseEmit('devicesStatus', { id: req.params.id, connected: false, error: result.error });
+  }
+  res.json(result);
+});
+
+// ── DELETE /api/devices-config/:id/users/clear — delete ALL users on a specific device ──
+// Alias for clear-all when only users need to be removed (not logs).
+app.delete('/api/devices-config/:id/users', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+  // FK623 has no "delete all users" command — CLEAR_ALL wipes users + logs
+  const result = await bridge.send('CLEAR_ALL', 60000);
+  res.json(result);
+});
+
 // ── POST /api/devices-config/:id/sync-time — sync clock on a specific device ──
 app.post('/api/devices-config/:id/sync-time', requireDevPassword, async (req, res) => {
   const bridge = bridgeManager.get(req.params.id);

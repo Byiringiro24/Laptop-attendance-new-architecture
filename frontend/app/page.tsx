@@ -286,21 +286,27 @@ export default function SmartAttendanceDashboard() {
     es.addEventListener("devicesStatus", (e: MessageEvent) => {
       try {
         const { id, connected: conn, error, deviceInfo } = JSON.parse(e.data);
-        setRegisteredDevices(prev => prev.map(d =>
-          d.id === id
-            ? {
-                ...d,
-                // Auto-update port if bridge auto-detected a working one
-                ...(deviceInfo?.port && { port: deviceInfo.port }),
-                status: {
-                  connected: conn,
-                  error: error || undefined,
-                  lastAttempt: new Date().toISOString(),
-                  deviceInfo: deviceInfo || d.status?.deviceInfo,
-                },
-              }
-            : d
-        ));
+        setRegisteredDevices(prev => {
+          const updated = prev.map(d =>
+            d.id === id
+              ? {
+                  ...d,
+                  ...(deviceInfo?.port && { port: deviceInfo.port }),
+                  status: {
+                    connected: conn,
+                    error: error || undefined,
+                    lastAttempt: new Date().toISOString(),
+                    deviceInfo: deviceInfo || d.status?.deviceInfo,
+                  },
+                }
+              : d
+          );
+          // Keep top-level connected state in sync with per-device reality
+          const anyOnline = updated.some(d => d.status?.connected);
+          setConnected(anyOnline);
+          setConnectStatus(anyOnline ? "connected" : "offline");
+          return updated;
+        });
         setDeviceBusy(prev => { const s = new Set(prev); s.delete(id); return s; });
       } catch {}
     });
@@ -356,9 +362,16 @@ export default function SmartAttendanceDashboard() {
         }
         return Array.from(byId.values());
       });
-      // If any registered device is connected, reflect that in the top-level connected state
+      // If any registered device is connected, reflect that in the top-level connected state.
+      // If we have registered devices but NONE are connected, mark as offline.
       const anyConnected = data.registeredDevices.some((d: any) => d.status?.connected);
-      if (anyConnected) { setConnected(true); setConnectStatus("connected"); }
+      if (anyConnected) {
+        setConnected(true); setConnectStatus("connected");
+      } else if (data.registeredDevices.length > 0) {
+        // All registered devices are offline — update top-level status accordingly
+        setConnected(false);
+        setConnectStatus("offline");
+      }
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
