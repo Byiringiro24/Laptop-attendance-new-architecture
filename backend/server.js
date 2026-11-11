@@ -160,6 +160,7 @@ async function getWireGuardRuntimeStatus() {
   };
 }
 
+const { DeviceBridgeManager } = require('./device-bridge');
 const app = express();
 
 app.use(cors());
@@ -1625,6 +1626,8 @@ app.get('/api/health', async (req, res) => {
       dns:            WG_DNS,
     },
     serverApiUrl: SERVER_API_URL,
+    // Per-device live status from the bridge manager
+    registeredDevices: getDevicesWithStatus(),
   });
 });
 
@@ -1665,8 +1668,7 @@ app.get('/api/events', (req, res) => {
 
   // Send all device statuses so the devices page loads with current state immediately
   try {
-    const devList = loadDevicesList();
-    const devWithStatus = devList.map(d => ({ ...d, status: deviceStatusMap.get(d.id) || { connected: false } }));
+    const devWithStatus = getDevicesWithStatus();
     res.write(`event: devicesInit\ndata: ${JSON.stringify(devWithStatus)}\n\n`);
   } catch { /* non-fatal */ }
 
@@ -2110,26 +2112,36 @@ app.get('/api/dashboard/stats', async (req, res) => {
 
   // Per-device student counts using the devices list
   const devicesList = loadDevicesList();
-  const perDevice = devicesList.map(d => ({
-    id:        d.id,
-    name:      d.name,
-    ipAddress: d.ipAddress,
-    location:  d.location,
-    connected: !!(deviceStatusMap.get(d.id)?.connected),
-    studentCount: students.filter(s =>
-      s.registeredOnDevice === d.ipAddress ||
-      s.assignedDeviceId   === d.ipAddress
-    ).length,
-  }));
+  const perDevice = devicesList.map(d => {
+    const bridge = bridgeManager.get(d.id);
+    const isConnected = bridge ? bridge.connected : !!(deviceStatusMap.get(d.id)?.connected);
+    return {
+      id:        d.id,
+      name:      d.name,
+      ipAddress: d.ipAddress,
+      location:  d.location,
+      connected: isConnected,
+      deviceInfo: bridge?.deviceInfo || null,
+      studentCount: students.filter(s =>
+        s.registeredOnDevice === d.ipAddress ||
+        s.assignedDeviceId   === d.ipAddress
+      ).length,
+    };
+  });
+
+  const onlineCount = devicesList.length
+    ? devicesList.filter(d => {
+        const bridge = bridgeManager.get(d.id);
+        return bridge ? bridge.connected : !!(deviceStatusMap.get(d.id)?.connected);
+      }).length
+    : (currentDevice?.connected ? 1 : 0);
 
   res.json({
     success: true,
     stats: {
       totalStudents: students.length || usersCache.length,
       totalDevices: devicesList.length || (currentDevice ? 1 : 0),
-      onlineDevices: devicesList.length
-        ? devicesList.filter(d => deviceStatusMap.get(d.id)?.connected).length
-        : (currentDevice?.connected ? 1 : 0),
+      onlineDevices: onlineCount,
       attendanceToday: new Set(todayLogs.map((log) => log.userId)).size,
       lateStudents: lateCount,
       totalLogs: logsCache.length,
@@ -3319,8 +3331,10 @@ app.post('/api/school/photos/sync-all', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`FK Attendance Backend running on http://localhost:${PORT}`);
   startBridge();
-  // Kick off auto-connect shortly after bridge starts
+  // Kick off auto-connect shortly after bridge starts (legacy single-device flow)
   scheduleAutoConnect(3000);
+  // Start one FKBridge process per registered device (multi-device parallel operation)
+  startAllDeviceBridges().catch(err => console.warn('[bridge-mgr] startup error:', err.message));
 
   // Sync missing photos 30 seconds after startup (give token time to load)
   // Runs silently — downloads any photos in students.json that are missing from cache
@@ -3690,12 +3704,110 @@ function sanitizeDevice(raw) {
 // key: device id, value: { connected, deviceId, error, lastAttempt }
 const deviceStatusMap = new Map();
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// MULTI-DEVICE BRIDGE MANAGER
+// One FKBridge.exe process per registered device — fully parallel operation.
+// Each device has its own command queue, log poll (every 2s), and status check (every 15s).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Called by each DeviceBridge when new attendance logs arrive from its device.
+ * Merges them into the global logsCache and emits over SSE — same path as single-device poll.
+ */
+function onDeviceLog(deviceId, deviceConfig, newLogs) {
+  if (!Array.isArray(newLogs) || !newLogs.length) return;
+
+  // Map raw FK623 log objects to the same shape attendanceFromLog produces
+  // so the existing SSE / frontend code works without changes.
+  const mapped = newLogs.map(raw => ({
+    ...attendanceFromLog(raw),
+    deviceConfigId: deviceId,
+    deviceName:     deviceConfig.name || deviceConfig.ipAddress,
+    bootId:         deviceId, // use deviceId as stable boot namespace
+  }));
+
+  // Merge into global logsCache
+  const existingIds = new Set(logsCache.map(l => l.id));
+  const truly_new = mapped.filter(l => !existingIds.has(l.id));
+  if (truly_new.length) {
+    logsCache = [...logsCache, ...truly_new].slice(-5000); // keep last 5000
+    sseEmit('attendance', truly_new);
+    console.log(`[bridge-mgr:${deviceConfig.name || deviceId.slice(0,8)}] ${truly_new.length} new log(s) emitted`);
+  }
+}
+
+/**
+ * Called by each DeviceBridge when connection state changes.
+ * Updates deviceStatusMap and broadcasts SSE events.
+ */
+function onDeviceStatus(deviceId, status) {
+  const prev = deviceStatusMap.get(deviceId);
+  deviceStatusMap.set(deviceId, {
+    connected:   status.connected,
+    deviceId:    status.deviceInfo?.deviceId || '',
+    ipAddress:   status.ipAddress,
+    error:       status.error || null,
+    lastAttempt: status.lastAttempt || new Date().toISOString(),
+    deviceInfo:  status.deviceInfo || null,
+  });
+
+  // Broadcast per-device status update
+  sseEmit('devicesStatus', {
+    id:        deviceId,
+    connected: status.connected,
+    ipAddress: status.ipAddress,
+    name:      status.name,
+    error:     status.error || null,
+    deviceInfo: status.deviceInfo || null,
+  });
+
+  // Also update the main deviceStatus channel — this keeps the existing
+  // single-device frontend connection indicators working
+  if (status.connected !== (prev?.connected)) {
+    sseEmit('deviceStatus', {
+      connected: status.connected,
+      ipAddress: status.ipAddress,
+      deviceId:  status.deviceInfo?.deviceId || '',
+      error:     status.error || null,
+      source:    'bridge-manager',
+    });
+  }
+
+  // Also check if the working port changed and persist it
+  const bridge = bridgeManager.get(deviceId);
+  if (bridge && bridge._portChanged) {
+    const list = loadDevicesList();
+    const i = list.findIndex(d => d.id === deviceId);
+    if (i !== -1) {
+      list[i].port = bridge._portChanged;
+      list[i].updatedAt = new Date().toISOString();
+      saveDevicesList(list);
+    }
+    bridge._portChanged = null;
+  }
+}
+
+// Create the manager — it will be populated when devices are loaded at startup
+const bridgeManager = new DeviceBridgeManager(dataDir, onDeviceLog, onDeviceStatus);
+
+/** Load all registered devices and start a bridge for each one */
+async function startAllDeviceBridges() {
+  const list = loadDevicesList();
+  if (!list.length) return;
+  console.log(`[bridge-mgr] Starting bridges for ${list.length} device(s)...`);
+  await Promise.all(list.map(d => bridgeManager.upsert(d)));
+}
+
 function getDevicesWithStatus() {
   const list = loadDevicesList();
-  return list.map(d => ({
-    ...d,
-    status: deviceStatusMap.get(d.id) || { connected: false },
-  }));
+  return list.map(d => {
+    // Prefer the bridge manager's live state over deviceStatusMap
+    const bridge = bridgeManager.get(d.id);
+    const liveStatus = bridge
+      ? { connected: bridge.connected, deviceId: bridge.deviceInfo?.deviceId || d.deviceId, error: bridge.lastError, lastAttempt: bridge.lastAttempt, deviceInfo: bridge.deviceInfo }
+      : (deviceStatusMap.get(d.id) || { connected: false });
+    return { ...d, status: liveStatus };
+  });
 }
 
 // ── GET /api/devices-config — list all devices ───────────────────────────────
@@ -3703,8 +3815,13 @@ app.get('/api/devices-config', (req, res) => {
   res.json({ success: true, devices: getDevicesWithStatus() });
 });
 
+// ── GET /api/devices-config/status — per-device live status from bridge manager ──
+app.get('/api/devices-config/status', (req, res) => {
+  res.json({ success: true, devices: bridgeManager.getAllStatus() });
+});
+
 // ── POST /api/devices-config — add a new device ──────────────────────────────
-app.post('/api/devices-config', (req, res) => {
+app.post('/api/devices-config', async (req, res) => {
   const { name, ipAddress, port, license, deviceId, location, notes, timeoutMs } = req.body || {};
   if (!ipAddress || !/^\d{1,3}(\.\d{1,3}){3}$/.test(String(ipAddress).trim())) {
     return res.status(400).json({ success: false, error: 'Valid IPv4 address is required' });
@@ -3719,6 +3836,8 @@ app.post('/api/devices-config', (req, res) => {
   list.push(device);
   saveDevicesList(list);
   console.log(`[devices-config] added: ${device.name} (${device.ipAddress})`);
+  // Start a bridge immediately for the new device
+  bridgeManager.upsert(device).catch(err => console.warn(`[bridge-mgr] start failed for ${device.name}:`, err.message));
   res.status(201).json({ success: true, device: { ...device, status: { connected: false } } });
 });
 
@@ -3736,7 +3855,11 @@ app.put('/api/devices-config/:id', (req, res) => {
   list[idx] = updated;
   saveDevicesList(list);
   console.log(`[devices-config] updated: ${updated.name} (${updated.ipAddress})`);
-  res.json({ success: true, device: { ...updated, status: deviceStatusMap.get(id) || { connected: false } } });
+  // Update the bridge config — will reconnect if IP/port/license changed
+  bridgeManager.upsert(updated).catch(() => null);
+  const bridge = bridgeManager.get(id);
+  const status = bridge ? { connected: bridge.connected, error: bridge.lastError } : (deviceStatusMap.get(id) || { connected: false });
+  res.json({ success: true, device: { ...updated, status } });
 });
 
 // ── DELETE /api/devices-config/:id — remove a device ─────────────────────────
@@ -3748,6 +3871,9 @@ app.delete('/api/devices-config/:id', (req, res) => {
   const removed = list.splice(idx, 1)[0];
   saveDevicesList(list);
   deviceStatusMap.delete(id);
+  // Stop and destroy the bridge for this device
+  bridgeManager.remove(id);
+  sseEmit('devicesStatus', { id, connected: false, removed: true });
   console.log(`[devices-config] removed: ${removed.name} (${removed.ipAddress})`);
   res.json({ success: true, removed });
 });
@@ -3759,68 +3885,22 @@ app.post('/api/devices-config/:id/connect', async (req, res) => {
   const device = list.find(d => d.id === id);
   if (!device) return res.status(404).json({ success: false, error: 'Device not found' });
 
-  deviceStatusMap.set(id, { connected: false, lastAttempt: new Date().toISOString(), error: null });
+  // Ensure bridge exists for this device
+  await bridgeManager.upsert(device);
 
-  // FK623 devices use either port 5005 or 4370 — auto-try both if the first fails with -2 (SDK rejection)
-  // Also try license 0 (some devices ignore the license parameter) if the configured license fails
-  const portsToTry = [device.port || 5005];
-  if (!portsToTry.includes(4370)) portsToTry.push(4370);
-  if (!portsToTry.includes(5005)) portsToTry.push(5005);
+  // Trigger an immediate reconnect via the bridge manager
+  const result = await bridgeManager.connect(id);
 
-  let lastError = null;
-  let lastResult = null;
-
-  try {
-    await ensureBridge();
-    const { ipAddress, license = 1261, deviceId = '', timeoutMs = 15000 } = device;
-
-    for (const port of portsToTry) {
-      const result = await sendCommand(
-        `CONNECT|${ipAddress}|${port}|${license}|${deviceId}|0|-1|${Math.min(timeoutMs, 10000)}`,
-        Math.min(timeoutMs, 10000) + 5000
-      );
-      lastResult = result;
-      if (result.success) {
-        // Persist the working port back to device config
-        if (port !== device.port) {
-          const updatedList = loadDevicesList();
-          const i = updatedList.findIndex(d => d.id === id);
-          if (i !== -1) { updatedList[i].port = port; updatedList[i].updatedAt = new Date().toISOString(); saveDevicesList(updatedList); }
-          console.log(`[devices-config] Auto-detected working port ${port} for ${ipAddress} — saved`);
-        }
-        deviceStatusMap.set(id, { connected: true, deviceId: result.data?.deviceId || deviceId, lastAttempt: new Date().toISOString(), error: null });
-        if (result.data?.deviceId && !device.deviceId) {
-          const updatedList = loadDevicesList();
-          const i = updatedList.findIndex(d => d.id === id);
-          if (i !== -1) { updatedList[i].deviceId = result.data.deviceId; updatedList[i].updatedAt = new Date().toISOString(); saveDevicesList(updatedList); }
-        }
-        sseEmit('devicesStatus', { id, connected: true, ipAddress, port });
-        sseEmit('deviceStatus', { connected: true, ipAddress, deviceId: result.data?.deviceId || deviceId });
-        return res.json({ success: true, connected: true, port, device: result.data });
-      }
-      lastError = result.error;
-      // Only try alternate ports if this was a "reachable but rejected" error (code -2)
-      // If it's truly unreachable (-2 "not reachable" at network level), no point trying other ports
-      const isReachableButRejected = lastError && (lastError.includes('-2') || lastError.includes('not reachable'));
-      if (!isReachableButRejected) break; // Network unreachable — don't waste time on other ports
-    }
-
-    // All ports failed — build a helpful error message
-    const isLicenseError = lastError && lastError.includes('-2');
+  if (result.success) {
+    res.json({ success: true, connected: true, device: result.data || null });
+  } else {
+    const isLicenseError = String(result.error || '').includes('-2');
     const friendlyError = isLicenseError
-      ? `Device is reachable on the network but the FK SDK rejected the connection. ` +
-        `Check: 1) License number on the device sticker (currently set to ${license}). ` +
-        `2) Network password (default is 0). 3) Try port 4370 or 5005.`
-      : lastError || 'Connection failed';
-
-    deviceStatusMap.set(id, { connected: false, lastAttempt: new Date().toISOString(), error: friendlyError });
-    sseEmit('devicesStatus', { id, connected: false, ipAddress: device.ipAddress, error: friendlyError });
-    sseEmit('deviceStatus', { connected: false, ipAddress: device.ipAddress, error: friendlyError });
+      ? `Device is reachable but the FK SDK rejected the connection. ` +
+        `Check: 1) License number on the device sticker (currently ${device.license}). ` +
+        `2) Network password (default 0). 3) Port (try 4370 or 5005).`
+      : result.error || 'Connection failed';
     res.json({ success: false, connected: false, error: friendlyError, hint: isLicenseError ? 'license_mismatch' : null });
-  } catch (err) {
-    deviceStatusMap.set(id, { connected: false, lastAttempt: new Date().toISOString(), error: err.message });
-    sseEmit('devicesStatus', { id, connected: false, error: err.message });
-    res.status(500).json({ success: false, connected: false, error: err.message });
   }
 });
 
@@ -3830,20 +3910,26 @@ app.post('/api/devices-config/:id/disconnect', async (req, res) => {
   const list = loadDevicesList();
   const device = list.find(d => d.id === id);
   if (!device) return res.status(404).json({ success: false, error: 'Device not found' });
-  try {
-    await sendCommand('DISCONNECT', 5000);
-    deviceStatusMap.set(id, { connected: false, lastAttempt: new Date().toISOString(), error: null });
-    sseEmit('devicesStatus', { id, connected: false, ipAddress: device.ipAddress });
-    res.json({ success: true, disconnected: true });
-  } catch (err) {
-    deviceStatusMap.set(id, { connected: false, lastAttempt: new Date().toISOString(), error: err.message });
-    res.status(500).json({ success: false, error: err.message });
-  }
+  const result = await bridgeManager.disconnect(id);
+  res.json(result);
+});
+
+// ── POST /api/devices-config/:id/command — send a raw command to one device ──
+// Body: { command: "STATUS" | "GET_USERS" | etc., timeoutMs? }
+// Protected by dev password — allows per-device operations from the UI
+app.post('/api/devices-config/:id/command', requireDevPassword, async (req, res) => {
+  const { id } = req.params;
+  const { command, timeoutMs = 30000 } = req.body || {};
+  if (!command) return res.status(400).json({ success: false, error: 'command is required' });
+  const bridge = bridgeManager.get(id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'No bridge running for this device' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+  const result = await bridge.send(command, Number(timeoutMs) || 30000);
+  res.json(result);
 });
 
 // ── POST /api/devices-config/bulk-import — import many devices at once ────────
-// Body: { devices: [{ name, ipAddress, port?, license?, location?, notes? }] }
-app.post('/api/devices-config/bulk-import', (req, res) => {
+app.post('/api/devices-config/bulk-import', async (req, res) => {
   const incoming = Array.isArray(req.body?.devices) ? req.body.devices : [];
   if (!incoming.length) return res.status(400).json({ success: false, error: 'No devices provided' });
   const list = loadDevicesList();
@@ -3859,6 +3945,8 @@ app.post('/api/devices-config/bulk-import', (req, res) => {
     added.push(device);
   }
   saveDevicesList(list);
+  // Start bridges for all newly added devices
+  await Promise.all(added.map(d => bridgeManager.upsert(d).catch(() => null)));
   console.log(`[devices-config] bulk-import: ${added.length} added, ${skipped.length} skipped`);
   res.json({ success: true, added: added.length, skipped: skipped.length, skippedDetails: skipped });
 });
@@ -3873,6 +3961,7 @@ app.get('/api/device/config', (req, res) => {
 });
 
 process.on('SIGINT', () => {
+  bridgeManager.stopAll();
   if (bridgeProcess) bridgeProcess.kill();
   process.exit(0);
 });

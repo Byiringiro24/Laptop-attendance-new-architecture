@@ -3,12 +3,16 @@
 /**
  * DevicesPage — full multi-device management UI
  *
+ * Each registered device has its own FKBridge.exe process (server-side).
+ * All devices connect and poll in parallel — this page shows real live
+ * status for every device independently.
+ *
  * Features:
- *  - List all configured biometric devices with live connection status
+ *  - Live per-device status (online/offline/connecting) via SSE
+ *  - Device details from live STATUS: users, logs, model, serial
  *  - Add / Edit / Delete devices
- *  - Connect / Disconnect individual devices
- *  - Bulk CSV import (name,ipAddress,port,license,location)
- *  - Live SSE updates via devicesInit + devicesStatus events
+ *  - Per-device connect / disconnect
+ *  - Bulk CSV import
  *  - Search + filter by status / location
  */
 
@@ -18,12 +22,28 @@ import {
   FiPlus, FiTrash2, FiEdit2, FiZap, FiZapOff,
   FiSearch, FiUploadCloud, FiRefreshCw, FiX,
   FiWifi, FiWifiOff, FiMapPin, FiCpu, FiAlertTriangle,
-  FiCheckCircle, FiLoader, FiDownload,
+  FiCheckCircle, FiLoader, FiDownload, FiUsers, FiDatabase,
+  FiActivity, FiInfo,
 } from "react-icons/fi";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
 
 /* ─── Types ──────────────────────────────────────────────── */
+export type DeviceInfo = {
+  connected?: boolean;
+  users?: number;
+  logs?: number;
+  fingerprints?: number;
+  faces?: number;
+  cards?: number;
+  serialNumber?: string;
+  productCode?: string;
+  productName?: string;
+  ipAddress?: string;
+  port?: number;
+  protocolType?: number;
+};
+
 export type BiometricDevice = {
   id: string;
   name: string;
@@ -36,32 +56,68 @@ export type BiometricDevice = {
   timeoutMs: number;
   createdAt: string;
   updatedAt: string;
-  status: { connected: boolean; error?: string; lastAttempt?: string };
+  status: {
+    connected: boolean;
+    error?: string;
+    lastAttempt?: string;
+    deviceInfo?: DeviceInfo;
+  };
 };
 
-type FormState = Omit<BiometricDevice, "id" | "createdAt" | "updatedAt" | "status">;
+type FormState = {
+  name: string; ipAddress: string; port: number; license: number;
+  deviceId: string; location: string; notes: string; timeoutMs: number;
+};
 
 const emptyForm: FormState = {
   name: "", ipAddress: "", port: 5005, license: 1261,
   deviceId: "", location: "", notes: "", timeoutMs: 15000,
 };
 
-/* ─── Helpers ────────────────────────────────────────────── */
-function StatusBadge({ status, busy }: { status: BiometricDevice["status"]; busy?: boolean }) {
+/* ─── Status badge ───────────────────────────────────────── */
+function StatusBadge({ status, busy }: {
+  status: BiometricDevice["status"];
+  busy?: boolean;
+}) {
   if (busy) return (
-    <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2.5 py-1 text-[11px] font-semibold text-amber-300">
-      <FiLoader className="animate-spin text-[10px]" /> Connecting…
+    <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
+      <FiLoader className="animate-spin text-[9px]" /> Connecting
     </span>
   );
   if (status.connected) return (
-    <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2.5 py-1 text-[11px] font-semibold text-emerald-300">
-      <FiWifi className="text-[10px]" /> Online
+    <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
+      <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" /> Online
     </span>
   );
   return (
-    <span className="inline-flex items-center gap-1 rounded-full bg-slate-700/60 px-2.5 py-1 text-[11px] font-semibold text-slate-400">
-      <FiWifiOff className="text-[10px]" /> Offline
+    <span className="inline-flex items-center gap-1 rounded-full bg-slate-700/60 px-2 py-0.5 text-[10px] font-semibold text-slate-400">
+      <span className="h-1.5 w-1.5 rounded-full bg-slate-600" /> Offline
     </span>
+  );
+}
+
+/* ─── Device info strip ──────────────────────────────────── */
+function DeviceInfoStrip({ info }: { info?: DeviceInfo }) {
+  if (!info || !info.connected) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-2 mt-1">
+      {info.users != null && (
+        <span className="flex items-center gap-1 text-[10px] text-slate-500">
+          <FiUsers className="text-cyan-500/70" /> {info.users} users
+        </span>
+      )}
+      {info.logs != null && (
+        <span className="flex items-center gap-1 text-[10px] text-slate-500">
+          <FiDatabase className="text-slate-600" /> {info.logs} logs
+        </span>
+      )}
+      {info.productName && (
+        <span className="text-[10px] text-slate-600">{info.productName}</span>
+      )}
+      {info.serialNumber && (
+        <span className="text-[10px] text-slate-600 font-mono">{info.serialNumber}</span>
+      )}
+    </div>
   );
 }
 
@@ -74,6 +130,7 @@ export default function DevicesPage() {
   const [busyIds, setBusyIds]       = useState<Set<string>>(new Set());
   const [query, setQuery]           = useState("");
   const [filterStatus, setFilter]   = useState<"all" | "online" | "offline">("all");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   // Modal state
   const [modalOpen, setModalOpen]   = useState(false);
@@ -91,7 +148,7 @@ export default function DevicesPage() {
   const [deleteId, setDeleteId]     = useState<string | null>(null);
   const [deleting, setDeleting]     = useState(false);
 
-  const sseRef = useRef<EventSource | null>(null);
+  const sseRef     = useRef<EventSource | null>(null);
   const mountedRef = useRef(true);
 
   /* ── Load devices ─────────────────────────────────────── */
@@ -99,18 +156,19 @@ export default function DevicesPage() {
     try {
       const r = await fetch(`${API_BASE}/api/devices-config`);
       const d = await r.json();
-      if (d.success) setDevices(d.devices || []);
+      if (d.success && mountedRef.current) setDevices(d.devices || []);
     } catch { toast.error("Failed to load devices"); }
-    finally { setLoading(false); }
+    finally { if (mountedRef.current) setLoading(false); }
   }, []);
 
-  /* ── SSE for live status ──────────────────────────────── */
+  /* ── SSE — live per-device status ────────────────────── */
   useEffect(() => {
     mountedRef.current = true;
     loadDevices();
 
     const es = new EventSource(`${API_BASE}/api/events`);
 
+    // Initial snapshot — all devices with current status from bridge manager
     es.addEventListener("devicesInit", (e: MessageEvent) => {
       try {
         const list: BiometricDevice[] = JSON.parse(e.data);
@@ -118,20 +176,31 @@ export default function DevicesPage() {
       } catch {}
     });
 
+    // Individual device status update — fires every time a bridge changes state
     es.addEventListener("devicesStatus", (e: MessageEvent) => {
       try {
-        const { id, connected, error } = JSON.parse(e.data);
+        const { id, connected, error, deviceInfo } = JSON.parse(e.data);
         if (!mountedRef.current) return;
         setDevices(prev => prev.map(d =>
           d.id === id
-            ? { ...d, status: { connected, error: error || undefined, lastAttempt: new Date().toISOString() } }
+            ? {
+                ...d,
+                // Update port if auto-detected
+                ...(deviceInfo?.port && { port: deviceInfo.port }),
+                status: {
+                  connected,
+                  error:       error || undefined,
+                  lastAttempt: new Date().toISOString(),
+                  deviceInfo:  deviceInfo || d.status?.deviceInfo,
+                },
+              }
             : d
         ));
         setBusyIds(prev => { const s = new Set(prev); s.delete(id); return s; });
       } catch {}
     });
 
-    es.onerror = () => { /* SSE auto-reconnects */ };
+    es.onerror = () => { /* browser auto-reconnects SSE */ };
     sseRef.current = es;
 
     return () => {
@@ -142,32 +211,36 @@ export default function DevicesPage() {
 
   /* ── Connect / Disconnect ─────────────────────────────── */
   async function toggleConnect(device: BiometricDevice) {
-    const { id, ipAddress, status } = device;
+    const { id, status } = device;
     setBusyIds(prev => new Set(prev).add(id));
-
-    if (status.connected) {
-      try {
-        await fetch(`${API_BASE}/api/devices-config/${id}/disconnect`, { method: "POST" });
+    const ep = status.connected ? "disconnect" : "connect";
+    try {
+      const r = await fetch(`${API_BASE}/api/devices-config/${id}/${ep}`, { method: "POST" });
+      const d = await r.json();
+      if (!status.connected) {
+        if (d.connected) toast.success(`Connected to ${device.ipAddress}`);
+        else {
+          const hint = d.hint === "license_mismatch"
+            ? " — check license number on device sticker"
+            : "";
+          toast.error(`Cannot reach ${device.ipAddress}${hint}`);
+        }
+      } else {
         toast.success(`Disconnected ${device.name}`);
-      } catch { toast.error("Disconnect failed"); setBusyIds(prev => { const s = new Set(prev); s.delete(id); return s; }); }
-    } else {
-      try {
-        const r = await fetch(`${API_BASE}/api/devices-config/${id}/connect`, { method: "POST" });
-        const d = await r.json();
-        if (d.connected) toast.success(`Connected to ${ipAddress}`);
-        else toast.error(`Cannot reach ${ipAddress}: ${d.error || "unreachable"}`);
-      } catch { toast.error("Connect failed"); setBusyIds(prev => { const s = new Set(prev); s.delete(id); return s; }); }
-    }
-    // SSE will update status — no need to reload
+      }
+    } catch { toast.error("Request failed"); }
+    // Status will update via SSE
+    setBusyIds(prev => { const s = new Set(prev); s.delete(id); return s; });
   }
 
-  /* ── Add / Edit modal ─────────────────────────────────── */
+  /* ── Save device ──────────────────────────────────────── */
   function openAdd() {
     setEditId(null); setForm(emptyForm); setFormErr(""); setModalOpen(true);
   }
   function openEdit(d: BiometricDevice) {
     setEditId(d.id);
-    setForm({ name: d.name, ipAddress: d.ipAddress, port: d.port, license: d.license, deviceId: d.deviceId, location: d.location, notes: d.notes, timeoutMs: d.timeoutMs });
+    setForm({ name: d.name, ipAddress: d.ipAddress, port: d.port, license: d.license,
+               deviceId: d.deviceId, location: d.location, notes: d.notes, timeoutMs: d.timeoutMs });
     setFormErr(""); setModalOpen(true);
   }
   function closeModal() { setModalOpen(false); setEditId(null); setFormErr(""); }
@@ -178,12 +251,12 @@ export default function DevicesPage() {
     if (!form.ipAddress.trim()) { setFormErr("IP address is required"); return; }
     setSaving(true); setFormErr("");
     try {
-      const url   = editId ? `${API_BASE}/api/devices-config/${editId}` : `${API_BASE}/api/devices-config`;
+      const url    = editId ? `${API_BASE}/api/devices-config/${editId}` : `${API_BASE}/api/devices-config`;
       const method = editId ? "PUT" : "POST";
       const r = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(form) });
       const d = await r.json();
       if (!d.success) { setFormErr(d.error || "Save failed"); setSaving(false); return; }
-      toast.success(editId ? `Updated ${form.name}` : `Added ${form.name}`);
+      toast.success(editId ? `Updated ${form.name}` : `Added ${form.name} — bridge starting…`);
       closeModal();
       loadDevices();
     } catch (err: any) { setFormErr(err.message || "Network error"); }
@@ -197,8 +270,10 @@ export default function DevicesPage() {
     try {
       const r = await fetch(`${API_BASE}/api/devices-config/${deleteId}`, { method: "DELETE" });
       const d = await r.json();
-      if (d.success) { toast.success("Device removed"); setDevices(prev => prev.filter(x => x.id !== deleteId)); }
-      else toast.error(d.error || "Delete failed");
+      if (d.success) {
+        toast.success("Device removed and bridge stopped");
+        setDevices(prev => prev.filter(x => x.id !== deleteId));
+      } else toast.error(d.error || "Delete failed");
     } catch { toast.error("Network error"); }
     finally { setDeleting(false); setDeleteId(null); }
   }
@@ -208,21 +283,19 @@ export default function DevicesPage() {
     if (!importText.trim()) return;
     setImporting(true);
     try {
-      // Parse CSV: name,ipAddress,port,license,location
       const lines = importText.trim().split("\n").filter(l => l.trim() && !l.startsWith("#"));
       const parsed = lines.map(line => {
         const cols = line.split(",").map(c => c.trim());
-        return { name: cols[0], ipAddress: cols[1], port: Number(cols[2]) || 5005, license: Number(cols[3]) || 1261, location: cols[4] || "" };
+        return { name: cols[0], ipAddress: cols[1], port: Number(cols[2]) || 5005,
+                 license: Number(cols[3]) || 1261, location: cols[4] || "" };
       }).filter(d => d.name && d.ipAddress);
-
       if (!parsed.length) { toast.error("No valid rows found"); setImporting(false); return; }
-
       const r = await fetch(`${API_BASE}/api/devices-config/bulk-import`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ devices: parsed }),
       });
       const d = await r.json();
-      toast.success(`Imported ${d.added} device${d.added !== 1 ? "s" : ""}${d.skipped ? ` (${d.skipped} skipped)` : ""}`);
+      toast.success(`Imported ${d.added} device${d.added !== 1 ? "s" : ""}${d.skipped ? ` (${d.skipped} skipped)` : ""} — bridges starting…`);
       setImportOpen(false); setImportText(""); loadDevices();
     } catch (err: any) { toast.error(err.message || "Import failed"); }
     finally { setImporting(false); }
@@ -231,16 +304,12 @@ export default function DevicesPage() {
   /* ── Filter ───────────────────────────────────────────── */
   const filtered = devices.filter(d => {
     const q = query.toLowerCase();
-    const matchesQuery = !q || [d.name, d.ipAddress, d.location, d.deviceId].some(v => v?.toLowerCase().includes(q));
-    const matchesStatus =
-      filterStatus === "all"    ? true :
-      filterStatus === "online" ? d.status?.connected :
-      !d.status?.connected;
-    return matchesQuery && matchesStatus;
+    const matchQ = !q || [d.name, d.ipAddress, d.location, d.deviceId].some(v => v?.toLowerCase().includes(q));
+    const matchS = filterStatus === "all" ? true : filterStatus === "online" ? d.status?.connected : !d.status?.connected;
+    return matchQ && matchS;
   });
 
-  const onlineCount  = devices.filter(d => d.status?.connected).length;
-  const offlineCount = devices.length - onlineCount;
+  const onlineCount = devices.filter(d => d.status?.connected).length;
 
   /* ═══════════════════════════════════════════════════════
      RENDER
@@ -248,51 +317,56 @@ export default function DevicesPage() {
   return (
     <div className="flex h-full flex-col gap-4 overflow-hidden p-4 md:p-6">
 
-      {/* ── Header ─────────────────────────────────────── */}
+      {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 shrink-0">
         <div>
           <h1 className="text-lg font-bold text-white flex items-center gap-2">
             <FiCpu className="text-cyan-400" /> Biometric Devices
           </h1>
           <p className="text-xs text-slate-500 mt-0.5">
-            {devices.length} device{devices.length !== 1 ? "s" : ""} · {" "}
-            <span className="text-emerald-400">{onlineCount} online</span> · {" "}
-            <span className="text-slate-500">{offlineCount} offline</span>
+            {devices.length} registered ·{" "}
+            <span className="text-emerald-400 font-medium">{onlineCount} online</span> ·{" "}
+            <span className="text-slate-500">{devices.length - onlineCount} offline</span>
+            {devices.length > 0 && (
+              <span className="ml-2 text-slate-600">· each runs its own bridge process in parallel</span>
+            )}
           </p>
         </div>
         <div className="flex gap-2 flex-wrap">
-          <button onClick={loadDevices} className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:text-white transition">
+          <button onClick={loadDevices}
+            className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:text-white transition">
             <FiRefreshCw className="text-[12px]" /> Refresh
           </button>
-          <button onClick={() => setImportOpen(true)} className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:text-white transition">
+          <button onClick={() => setImportOpen(true)}
+            className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:text-white transition">
             <FiUploadCloud className="text-[12px]" /> Bulk Import
           </button>
-          <button onClick={openAdd} className="flex items-center gap-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 px-3 py-2 text-xs font-semibold text-white transition shadow-sm shadow-cyan-900/40">
+          <button onClick={openAdd}
+            className="flex items-center gap-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 px-3 py-2 text-xs font-semibold text-white transition">
             <FiPlus /> Add Device
           </button>
         </div>
       </div>
 
-      {/* ── Filters ────────────────────────────────────── */}
+      {/* Filters */}
       <div className="flex flex-wrap items-center gap-2 shrink-0">
         <div className="relative flex-1 min-w-[180px] max-w-xs">
           <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-[13px]" />
-          <input
-            value={query} onChange={e => setQuery(e.target.value)}
+          <input value={query} onChange={e => setQuery(e.target.value)}
             placeholder="Search name, IP, location…"
-            className="w-full rounded-xl border border-slate-700 bg-slate-800/80 pl-8 pr-3 py-2 text-xs text-slate-100 outline-none placeholder:text-slate-600 focus:border-cyan-500/60"
-          />
+            className="w-full rounded-xl border border-slate-700 bg-slate-800/80 pl-8 pr-3 py-2 text-xs text-slate-100 outline-none placeholder:text-slate-600 focus:border-cyan-500/60" />
         </div>
         {(["all", "online", "offline"] as const).map(f => (
           <button key={f} onClick={() => setFilter(f)}
-            className={`rounded-xl px-3 py-2 text-xs font-medium transition capitalize ${filterStatus === f ? "bg-cyan-600 text-white" : "border border-slate-700 bg-slate-800 text-slate-400 hover:text-white"}`}>
+            className={`rounded-xl px-3 py-2 text-xs font-medium transition capitalize
+              ${filterStatus === f ? "bg-cyan-600 text-white" : "border border-slate-700 bg-slate-800 text-slate-400 hover:text-white"}`}>
             {f}
           </button>
         ))}
       </div>
 
-      {/* ── Table ──────────────────────────────────────── */}
-      <div className="flex-1 overflow-auto rounded-2xl border border-slate-800 bg-slate-900/60">
+      {/* Device list */}
+      <div className="flex-1 overflow-y-auto space-y-2 pr-0.5">
         {loading ? (
           <div className="flex h-40 items-center justify-center text-slate-500 gap-2">
             <FiLoader className="animate-spin" /> Loading devices…
@@ -300,80 +374,129 @@ export default function DevicesPage() {
         ) : filtered.length === 0 ? (
           <div className="flex flex-col h-40 items-center justify-center text-slate-500 gap-2">
             <FiCpu className="text-2xl text-slate-700" />
-            <p className="text-sm">{devices.length === 0 ? "No devices configured yet." : "No devices match your search."}</p>
+            <p className="text-sm">{devices.length === 0 ? "No devices registered yet." : "No devices match your search."}</p>
             {devices.length === 0 && (
-              <button onClick={openAdd} className="mt-1 flex items-center gap-1 rounded-xl bg-cyan-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-cyan-500 transition">
+              <button onClick={openAdd}
+                className="mt-1 flex items-center gap-1 rounded-xl bg-cyan-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-cyan-500 transition">
                 <FiPlus /> Add first device
               </button>
             )}
           </div>
         ) : (
-          <table className="w-full text-left text-xs">
-            <thead className="border-b border-slate-800 text-[10px] uppercase tracking-wider text-slate-500 sticky top-0 bg-slate-900/95 backdrop-blur-sm">
-              <tr>
-                <th className="px-4 py-3">Name</th>
-                <th className="px-4 py-3">IP Address</th>
-                <th className="px-4 py-3 hidden sm:table-cell">Port / License</th>
-                <th className="px-4 py-3 hidden md:table-cell">Location</th>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3 text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800/60">
-              {filtered.map(d => {
-                const isBusy = busyIds.has(d.id);
-                return (
-                  <tr key={d.id} className="group hover:bg-slate-800/40 transition">
-                    <td className="px-4 py-3 font-medium text-white">
-                      <div className="flex flex-col">
-                        <span>{d.name}</span>
-                        {d.deviceId && <span className="text-[10px] text-slate-500 font-mono">{d.deviceId}</span>}
+          filtered.map(d => {
+            const isBusy    = busyIds.has(d.id);
+            const isConn    = d.status?.connected;
+            const info      = d.status?.deviceInfo;
+            const isExpanded = expandedId === d.id;
+
+            return (
+              <div key={d.id}
+                className={`rounded-2xl border transition-all
+                  ${isConn
+                    ? "border-emerald-500/25 bg-emerald-500/5"
+                    : "border-slate-800 bg-slate-900/50"}`}>
+
+                {/* Main row */}
+                <div className="flex items-center gap-3 px-4 py-3">
+                  {/* Status indicator */}
+                  <div className={`h-2.5 w-2.5 shrink-0 rounded-full
+                    ${isBusy ? "bg-amber-400 animate-pulse"
+                      : isConn ? "bg-emerald-400 animate-pulse"
+                      : "bg-slate-600"}`} />
+
+                  {/* Identity */}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-semibold text-white text-sm">{d.name}</span>
+                      <StatusBadge status={d.status} busy={isBusy} />
+                      {d.location && (
+                        <span className="flex items-center gap-1 text-[11px] text-slate-500">
+                          <FiMapPin className="text-[10px]" /> {d.location}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-3 mt-0.5 flex-wrap">
+                      <span className="font-mono text-[11px] text-cyan-400">{d.ipAddress}:{d.port}</span>
+                      <span className="text-[11px] text-slate-600">lic {d.license}</span>
+                      {d.deviceId && <span className="font-mono text-[10px] text-slate-600">{d.deviceId}</span>}
+                    </div>
+                    {/* Live device info strip when connected */}
+                    <DeviceInfoStrip info={info} />
+                    {/* Error */}
+                    {!isConn && !isBusy && d.status?.error && (
+                      <p className="mt-0.5 text-[10px] text-red-400 truncate max-w-sm flex items-center gap-1" title={d.status.error}>
+                        <FiAlertTriangle className="shrink-0" />
+                        {d.status.error.includes("sticker") || d.status.error.includes("license")
+                          ? "⚠ Check license number on device sticker"
+                          : d.status.error.split("|")[0].split(".")[0]}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Actions */}
+                  <div className="flex items-center gap-1 shrink-0">
+                    {/* Expand for more info */}
+                    {isConn && (
+                      <button onClick={() => setExpandedId(isExpanded ? null : d.id)}
+                        title={isExpanded ? "Hide details" : "Show details"}
+                        className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-700 hover:text-white transition">
+                        <FiInfo className="text-sm" />
+                      </button>
+                    )}
+                    {/* Connect / Disconnect */}
+                    <button disabled={isBusy}
+                      onClick={() => toggleConnect(d)}
+                      title={isConn ? "Disconnect" : "Connect"}
+                      className={`rounded-lg p-1.5 transition disabled:opacity-40
+                        ${isConn
+                          ? "text-emerald-400 hover:bg-red-500/15 hover:text-red-400"
+                          : "text-slate-500 hover:bg-cyan-500/15 hover:text-cyan-400"}`}>
+                      {isBusy ? <FiLoader className="animate-spin text-sm" />
+                        : isConn ? <FiZapOff className="text-sm" />
+                        : <FiZap className="text-sm" />}
+                    </button>
+                    {/* Edit */}
+                    <button onClick={() => openEdit(d)} title="Edit"
+                      className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-700 hover:text-white transition">
+                      <FiEdit2 className="text-sm" />
+                    </button>
+                    {/* Delete */}
+                    <button onClick={() => setDeleteId(d.id)} title="Delete"
+                      className="rounded-lg p-1.5 text-slate-500 hover:bg-red-500/15 hover:text-red-400 transition">
+                      <FiTrash2 className="text-sm" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Expanded detail panel */}
+                {isExpanded && info && (
+                  <div className="border-t border-slate-800/60 px-4 py-3 grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    {[
+                      { label: "Users",        value: info.users,        icon: <FiUsers /> },
+                      { label: "Logs",         value: info.logs,         icon: <FiDatabase /> },
+                      { label: "Fingerprints", value: info.fingerprints, icon: <FiActivity /> },
+                      { label: "Faces",        value: info.faces,        icon: <FiActivity /> },
+                      { label: "Cards",        value: info.cards,        icon: <FiActivity /> },
+                      { label: "Protocol",     value: info.protocolType != null ? `P${info.protocolType}` : null, icon: <FiCpu /> },
+                      { label: "Model",        value: info.productName,  icon: <FiCpu /> },
+                      { label: "Serial",       value: info.serialNumber, icon: <FiCpu /> },
+                    ].filter(r => r.value != null && r.value !== "").map(row => (
+                      <div key={row.label} className="rounded-xl bg-slate-800/50 px-3 py-2">
+                        <p className="text-[9px] uppercase tracking-wider text-slate-600 mb-0.5">{row.label}</p>
+                        <p className="text-xs font-semibold text-slate-200">{String(row.value)}</p>
                       </div>
-                    </td>
-                    <td className="px-4 py-3 font-mono text-cyan-300">{d.ipAddress}</td>
-                    <td className="px-4 py-3 hidden sm:table-cell text-slate-400">
-                      {d.port} / {d.license}
-                    </td>
-                    <td className="px-4 py-3 hidden md:table-cell text-slate-400">
-                      {d.location ? (
-                        <span className="flex items-center gap-1"><FiMapPin className="text-[10px] text-slate-600" />{d.location}</span>
-                      ) : <span className="text-slate-700">—</span>}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex flex-col gap-1">
-                        <StatusBadge status={d.status} busy={isBusy} />
-                        {!isBusy && d.status?.error && (
-                          <span className="text-[10px] text-red-400 flex items-center gap-1 max-w-[160px] truncate" title={d.status.error}>
-                            <FiAlertTriangle className="shrink-0" />{d.status.error}
-                          </span>
-                        )}
+                    ))}
+                    {d.status?.lastAttempt && (
+                      <div className="col-span-2 rounded-xl bg-slate-800/50 px-3 py-2">
+                        <p className="text-[9px] uppercase tracking-wider text-slate-600 mb-0.5">Last checked</p>
+                        <p className="text-[10px] text-slate-400">{new Date(d.status.lastAttempt).toLocaleTimeString()}</p>
                       </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center justify-end gap-1">
-                        {/* Connect / Disconnect */}
-                        <button
-                          onClick={() => toggleConnect(d)}
-                          disabled={isBusy}
-                          title={d.status.connected ? "Disconnect" : "Connect"}
-                          className={`rounded-lg p-1.5 transition disabled:opacity-40 ${d.status.connected ? "text-emerald-400 hover:bg-red-500/15 hover:text-red-400" : "text-slate-500 hover:bg-cyan-500/15 hover:text-cyan-400"}`}>
-                          {d.status.connected ? <FiZapOff /> : <FiZap />}
-                        </button>
-                        {/* Edit */}
-                        <button onClick={() => openEdit(d)} title="Edit" className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-700 hover:text-white transition">
-                          <FiEdit2 />
-                        </button>
-                        {/* Delete */}
-                        <button onClick={() => setDeleteId(d.id)} title="Delete" className="rounded-lg p-1.5 text-slate-500 hover:bg-red-500/15 hover:text-red-400 transition">
-                          <FiTrash2 />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })
         )}
       </div>
 
@@ -386,52 +509,59 @@ export default function DevicesPage() {
               <button onClick={closeModal} className="text-slate-500 hover:text-white transition"><FiX /></button>
             </div>
             <form onSubmit={saveDevice} className="p-5 space-y-4">
-              {/* Row 1 */}
               <div className="grid grid-cols-2 gap-3">
                 <div className="col-span-2">
                   <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Device Name <span className="text-red-400">*</span></label>
-                  <input value={form.name} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} placeholder="e.g. Main Gate FK623"
+                  <input value={form.name} onChange={e => setForm(p => ({ ...p, name: e.target.value }))}
+                    placeholder="e.g. Main Gate FK623"
                     className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60" />
                 </div>
                 <div className="col-span-2 sm:col-span-1">
                   <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">IP Address <span className="text-red-400">*</span></label>
-                  <input value={form.ipAddress} onChange={e => setForm(p => ({ ...p, ipAddress: e.target.value }))} placeholder="192.168.1.76"
+                  <input value={form.ipAddress} onChange={e => setForm(p => ({ ...p, ipAddress: e.target.value }))}
+                    placeholder="192.168.1.76"
                     className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white font-mono outline-none focus:border-cyan-500/60" />
                 </div>
-                <div className="sm:col-span-1">
-                  <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Port</label>
-                  <input type="number" value={form.port} onChange={e => setForm(p => ({ ...p, port: Number(e.target.value) }))}
-                    className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60" />
-                </div>
-              </div>
-              {/* Row 2 */}
-              <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">License No.</label>
+                  <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Port</label>
+                  <select value={form.port} onChange={e => setForm(p => ({ ...p, port: Number(e.target.value) }))}
+                    className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60">
+                    <option value={5005}>5005 (FK623 default)</option>
+                    <option value={4370}>4370 (ZKTeco compat)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                    License No. <span className="text-amber-400">*</span>
+                  </label>
                   <input type="number" value={form.license} onChange={e => setForm(p => ({ ...p, license: Number(e.target.value) }))}
                     className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60" />
+                  <p className="mt-1 text-[10px] text-amber-400/80">Found on the sticker on the physical device</p>
                 </div>
                 <div>
                   <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Device ID</label>
-                  <input value={form.deviceId} onChange={e => setForm(p => ({ ...p, deviceId: e.target.value }))} placeholder="auto-detected"
+                  <input value={form.deviceId} onChange={e => setForm(p => ({ ...p, deviceId: e.target.value }))}
+                    placeholder="auto-detected on connect"
+                    className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60" />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Location</label>
+                  <input value={form.location} onChange={e => setForm(p => ({ ...p, location: e.target.value }))}
+                    placeholder="e.g. Boys Hostel"
+                    className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60" />
+                </div>
+                <div className="col-span-2">
+                  <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Notes</label>
+                  <input value={form.notes} onChange={e => setForm(p => ({ ...p, notes: e.target.value }))}
+                    placeholder="Optional"
                     className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60" />
                 </div>
               </div>
-              {/* Row 3 */}
-              <div>
-                <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Location</label>
-                <input value={form.location} onChange={e => setForm(p => ({ ...p, location: e.target.value }))} placeholder="e.g. Boys Hostel, Floor 2"
-                  className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60" />
-              </div>
-              <div>
-                <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Notes</label>
-                <input value={form.notes} onChange={e => setForm(p => ({ ...p, notes: e.target.value }))} placeholder="Optional notes"
-                  className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60" />
-              </div>
-              <div>
-                <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">Timeout (ms)</label>
-                <input type="number" value={form.timeoutMs} onChange={e => setForm(p => ({ ...p, timeoutMs: Number(e.target.value) }))}
-                  className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60" />
+
+              {/* Info callout */}
+              <div className="rounded-xl border border-slate-700/50 bg-slate-800/40 px-3 py-2 text-[11px] text-slate-500">
+                After saving, a dedicated bridge process starts automatically and connects to this device in the background.
+                Both ports (5005 and 4370) are tried automatically if the first fails.
               </div>
 
               {formErr && (
@@ -441,10 +571,14 @@ export default function DevicesPage() {
               )}
 
               <div className="flex gap-2 pt-1">
-                <button type="button" onClick={closeModal} className="flex-1 rounded-xl border border-slate-700 py-2 text-sm text-slate-400 hover:text-white transition">Cancel</button>
-                <button type="submit" disabled={saving} className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 py-2 text-sm font-semibold text-white transition disabled:opacity-50">
+                <button type="button" onClick={closeModal}
+                  className="flex-1 rounded-xl border border-slate-700 py-2 text-sm text-slate-400 hover:text-white transition">
+                  Cancel
+                </button>
+                <button type="submit" disabled={saving}
+                  className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 py-2 text-sm font-semibold text-white transition disabled:opacity-50">
                   {saving ? <FiLoader className="animate-spin" /> : <FiCheckCircle />}
-                  {saving ? "Saving…" : editId ? "Save Changes" : "Add Device"}
+                  {saving ? "Saving…" : editId ? "Save Changes" : "Add & Connect"}
                 </button>
               </div>
             </form>
@@ -461,25 +595,22 @@ export default function DevicesPage() {
               <button onClick={() => setImportOpen(false)} className="text-slate-500 hover:text-white transition"><FiX /></button>
             </div>
             <div className="p-5 space-y-4">
-              <p className="text-xs text-slate-400">
-                Paste CSV rows — one device per line:
-              </p>
+              <p className="text-xs text-slate-400">Paste CSV rows — one device per line:</p>
               <div className="rounded-xl bg-slate-800/60 border border-slate-700 px-3 py-2 font-mono text-[11px] text-slate-400">
                 <span className="text-slate-600"># name, ipAddress, port, license, location</span><br />
                 Main Gate,192.168.1.76,5005,1261,Gate<br />
-                Boys Hostel,192.168.1.77,5005,1262,Hostel A<br />
-                Girls Hostel,192.168.1.78,5005,1263,Hostel B
+                Boys Hostel,192.168.1.77,5005,1262,Hostel A
               </div>
-              <textarea
-                value={importText} onChange={e => setImportText(e.target.value)}
-                rows={8} placeholder={"MainGate,192.168.1.76,5005,1261,Gate\nBoysHostel,192.168.1.77,5005,1262,Hostel A"}
-                className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 font-mono text-xs text-white outline-none focus:border-cyan-500/60 resize-none"
-              />
+              <textarea value={importText} onChange={e => setImportText(e.target.value)}
+                rows={7} placeholder="MainGate,192.168.1.76,5005,1261,Gate"
+                className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 font-mono text-xs text-white outline-none focus:border-cyan-500/60 resize-none" />
               <div className="flex gap-2">
-                <button onClick={() => setImportOpen(false)} className="flex-1 rounded-xl border border-slate-700 py-2 text-sm text-slate-400 hover:text-white transition">Cancel</button>
-                <button onClick={runBulkImport} disabled={importing || !importText.trim()} className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 py-2 text-sm font-semibold text-white transition disabled:opacity-50">
+                <button onClick={() => setImportOpen(false)}
+                  className="flex-1 rounded-xl border border-slate-700 py-2 text-sm text-slate-400 hover:text-white transition">Cancel</button>
+                <button onClick={runBulkImport} disabled={importing || !importText.trim()}
+                  className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 py-2 text-sm font-semibold text-white transition disabled:opacity-50">
                   {importing ? <FiLoader className="animate-spin" /> : <FiDownload />}
-                  {importing ? "Importing…" : "Import"}
+                  {importing ? "Importing…" : "Import All"}
                 </button>
               </div>
             </div>
@@ -493,12 +624,14 @@ export default function DevicesPage() {
           <div className="w-full max-w-sm rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl p-5 space-y-4">
             <h2 className="text-sm font-bold text-white">Remove Device?</h2>
             <p className="text-xs text-slate-400">
-              This removes <strong className="text-white">{devices.find(d => d.id === deleteId)?.name}</strong> from the list.
-              The physical device is not affected.
+              This removes <strong className="text-white">{devices.find(d => d.id === deleteId)?.name}</strong>{" "}
+              from the list and stops its bridge process. The physical device is not affected.
             </p>
             <div className="flex gap-2">
-              <button onClick={() => setDeleteId(null)} className="flex-1 rounded-xl border border-slate-700 py-2 text-sm text-slate-400 hover:text-white transition">Cancel</button>
-              <button onClick={confirmDelete} disabled={deleting} className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-red-600 hover:bg-red-500 py-2 text-sm font-semibold text-white transition disabled:opacity-50">
+              <button onClick={() => setDeleteId(null)}
+                className="flex-1 rounded-xl border border-slate-700 py-2 text-sm text-slate-400 hover:text-white transition">Cancel</button>
+              <button onClick={confirmDelete} disabled={deleting}
+                className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-red-600 hover:bg-red-500 py-2 text-sm font-semibold text-white transition disabled:opacity-50">
                 {deleting ? <FiLoader className="animate-spin" /> : <FiTrash2 />}
                 {deleting ? "Removing…" : "Remove"}
               </button>

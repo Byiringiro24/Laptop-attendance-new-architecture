@@ -34,7 +34,13 @@ import DevicesPage           from "@/components/DevicesPage";
 type RegisteredDevice = {
   id: string; name: string; ipAddress: string; port: number;
   license: number; deviceId: string; location: string; notes: string;
-  status: { connected: boolean; error?: string; lastAttempt?: string };
+  status: {
+    connected: boolean; error?: string; lastAttempt?: string;
+    deviceInfo?: {
+      users?: number; logs?: number; fingerprints?: number; faces?: number;
+      serialNumber?: string; productName?: string; productCode?: string;
+    };
+  };
 };
 
 /* ─── Constants ──────────────────────────────────────── */
@@ -275,9 +281,21 @@ export default function SmartAttendanceDashboard() {
     });
     es.addEventListener("devicesStatus", (e: MessageEvent) => {
       try {
-        const { id, connected: conn, error } = JSON.parse(e.data);
+        const { id, connected: conn, error, deviceInfo } = JSON.parse(e.data);
         setRegisteredDevices(prev => prev.map(d =>
-          d.id === id ? { ...d, status: { connected: conn, error, lastAttempt: new Date().toISOString() } } : d
+          d.id === id
+            ? {
+                ...d,
+                // Auto-update port if bridge auto-detected a working one
+                ...(deviceInfo?.port && { port: deviceInfo.port }),
+                status: {
+                  connected: conn,
+                  error: error || undefined,
+                  lastAttempt: new Date().toISOString(),
+                  deviceInfo: deviceInfo || d.status?.deviceInfo,
+                },
+              }
+            : d
         ));
         setDeviceBusy(prev => { const s = new Set(prev); s.delete(id); return s; });
       } catch {}
@@ -323,6 +341,20 @@ export default function SmartAttendanceDashboard() {
     if (data?.devPassword) setDevPasswordActual(data.devPassword);
     if (data?.schoolName)  setSchoolName(data.schoolName);
     if (data?.fk623?.users != null) setDevice(p => p ? { ...p, users: data.fk623.users } : null);
+    // Sync per-device status from health poll (catches any updates SSE might have missed)
+    if (Array.isArray(data?.registeredDevices) && data.registeredDevices.length > 0) {
+      setRegisteredDevices(prev => {
+        // Merge health data into existing list — SSE is the primary source, health is the backup
+        const byId = new Map(prev.map(d => [d.id, d]));
+        for (const hd of data.registeredDevices) {
+          const existing = byId.get(hd.id);
+          if (!existing) { byId.set(hd.id, hd); continue; }
+          // Only update if health data is newer than what SSE delivered
+          byId.set(hd.id, { ...existing, status: hd.status || existing.status });
+        }
+        return Array.from(byId.values());
+      });
+    }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -1037,65 +1069,78 @@ export default function SmartAttendanceDashboard() {
                       </button>
                     </div>
                   ) : (
-                    /* Device grid — one tile per registered device */
-                    <div className={`grid gap-2 mb-4 ${registeredDevices.length === 1 ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2"}`}>
+                    /* Device grid — one tile per registered device, each with its own bridge */
+                    <div className="space-y-2 mb-4">
                       {registeredDevices.map(d => {
                         const isConn = d.status?.connected;
                         const isBusy = deviceBusy.has(d.id);
+                        const info   = d.status?.deviceInfo;
                         return (
                           <div key={d.id}
-                            className={`rounded-xl border px-3 py-2.5 flex items-center gap-3 transition
+                            className={`rounded-xl border px-3 py-2.5 transition
                               ${isConn ? "border-emerald-500/30 bg-emerald-500/5" : "border-slate-800 bg-slate-800/30"}`}>
-                            {/* Status dot */}
-                            <div className={`h-2.5 w-2.5 shrink-0 rounded-full
-                              ${isBusy ? "bg-amber-400 animate-pulse"
-                                : isConn ? "bg-emerald-400 animate-pulse"
-                                : "bg-slate-600"}`} />
-                            {/* Info */}
-                            <div className="flex-1 min-w-0">
-                              <div className="flex items-center gap-1.5">
-                                <span className="text-xs font-semibold text-white truncate">{d.name}</span>
-                                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full shrink-0
-                                  ${isConn ? "bg-emerald-500/20 text-emerald-300" : "bg-slate-700/80 text-slate-500"}`}>
-                                  {isBusy ? "…" : isConn ? "Online" : "Offline"}
-                                </span>
+                            <div className="flex items-center gap-3">
+                              {/* Status dot */}
+                              <div className={`h-2.5 w-2.5 shrink-0 rounded-full
+                                ${isBusy ? "bg-amber-400 animate-pulse"
+                                  : isConn ? "bg-emerald-400 animate-pulse"
+                                  : "bg-slate-600"}`} />
+                              {/* Info */}
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="text-xs font-semibold text-white truncate">{d.name}</span>
+                                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full shrink-0
+                                    ${isConn ? "bg-emerald-500/20 text-emerald-300" : "bg-slate-700/80 text-slate-500"}`}>
+                                    {isBusy ? "…" : isConn ? "Online" : "Offline"}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                                  <span className="text-[10px] font-mono text-cyan-400/80">{d.ipAddress}:{d.port}</span>
+                                  {d.location && <span className="text-[10px] text-slate-600">· {d.location}</span>}
+                                  {/* Live device stats when connected */}
+                                  {isConn && info && (
+                                    <>
+                                      {info.users != null && <span className="text-[10px] text-slate-500">{info.users} users</span>}
+                                      {info.logs  != null && <span className="text-[10px] text-slate-600">{info.logs} logs</span>}
+                                      {info.productName    && <span className="text-[10px] text-slate-600">{info.productName}</span>}
+                                    </>
+                                  )}
+                                </div>
+                                {!isConn && d.status?.error && (
+                                  <p className="text-[9px] text-red-400 truncate mt-0.5" title={d.status.error}>
+                                    {d.status.error.includes('sticker') || d.status.error.includes('license')
+                                      ? '⚠ Check license number on device sticker'
+                                      : d.status.error.split(':')[0]}
+                                  </p>
+                                )}
                               </div>
-                              <div className="flex items-center gap-1.5 mt-0.5">
-                                <span className="text-[10px] font-mono text-cyan-400/80">{d.ipAddress}</span>
-                                {d.location && <span className="text-[10px] text-slate-600 truncate">· {d.location}</span>}
-                              </div>
-                              {!isConn && d.status?.error && (
-                                <p className="text-[9px] text-red-400 truncate mt-0.5" title={d.status.error}>
-                                  {d.status.error.includes('license_mismatch') || d.status.error.includes('sticker')
-                                    ? '⚠ Check license number on device sticker'
-                                    : d.status.error.split(':')[0]}
-                                </p>
-                              )}
+                              {/* Connect / Disconnect */}
+                              <button disabled={isBusy}
+                                onClick={async () => {
+                                  setDeviceBusy(prev => new Set(prev).add(d.id));
+                                  try {
+                                    const ep = isConn ? "disconnect" : "connect";
+                                    const r = await fetch(`${API_BASE}/api/devices-config/${d.id}/${ep}`, { method: "POST" });
+                                    const res = await r.json();
+                                    if (!isConn && res.connected) toast.success(`Connected to ${d.ipAddress}`);
+                                    else if (!isConn) {
+                                      const hint = res.hint === "license_mismatch" ? " — check license on device sticker" : "";
+                                      toast.error(`Cannot reach ${d.ipAddress}${hint}`);
+                                    }
+                                    else toast.success(`Disconnected ${d.name}`);
+                                  } catch { toast.error("Request failed"); }
+                                  setDeviceBusy(prev => { const s = new Set(prev); s.delete(d.id); return s; });
+                                }}
+                                title={isConn ? "Disconnect" : "Connect"}
+                                className={`rounded-lg p-1.5 transition disabled:opacity-40 shrink-0
+                                  ${isConn
+                                    ? "text-emerald-400 hover:bg-red-500/15 hover:text-red-400"
+                                    : "text-slate-500 hover:bg-cyan-500/15 hover:text-cyan-400"}`}>
+                                {isBusy
+                                  ? <FiLoader className="text-sm animate-spin" />
+                                  : isConn ? <FiWifiOff className="text-sm" /> : <FiWifi className="text-sm" />}
+                              </button>
                             </div>
-                            {/* Connect / Disconnect button */}
-                            <button disabled={isBusy}
-                              onClick={async () => {
-                                setDeviceBusy(prev => new Set(prev).add(d.id));
-                                try {
-                                  const ep = isConn ? "disconnect" : "connect";
-                                  const r = await fetch(`${API_BASE}/api/devices-config/${d.id}/${ep}`, { method: "POST" });
-                                  const res = await r.json();
-                                  if (!isConn && res.connected) toast.success(`Connected to ${d.ipAddress}`);
-                                  else if (!isConn) toast.error(`Cannot reach ${d.ipAddress}`);
-                                  else toast.success(`Disconnected ${d.name}`);
-                                  await loadRegisteredDevices();
-                                } catch { toast.error("Request failed"); }
-                                setDeviceBusy(prev => { const s = new Set(prev); s.delete(d.id); return s; });
-                              }}
-                              title={isConn ? "Disconnect" : "Connect"}
-                              className={`rounded-lg p-1.5 transition disabled:opacity-40 shrink-0
-                                ${isConn
-                                  ? "text-emerald-400 hover:bg-red-500/15 hover:text-red-400"
-                                  : "text-slate-500 hover:bg-cyan-500/15 hover:text-cyan-400"}`}>
-                              {isBusy
-                                ? <FiLoader className="text-sm animate-spin" />
-                                : isConn ? <FiWifiOff className="text-sm" /> : <FiWifi className="text-sm" />}
-                            </button>
                           </div>
                         );
                       })}
