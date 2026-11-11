@@ -2009,6 +2009,124 @@ app.delete('/api/device/users/:id', async (req, res) => {
   apiResult(res, result);
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PER-DEVICE USER MANAGEMENT  (/api/devices-config/:id/...)
+// Routes to the specific device's bridge process — fully parallel.
+// All endpoints require dev password.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /api/devices-config/:id/users — pull users from a specific device ────
+app.get('/api/devices-config/:id/users', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+
+  const result = await bridge.send('GET_USERS', 60000);
+  if (!result.success) return apiResult(res, result);
+
+  const rawUsers = result.data?.users || [];
+  const enriched = aggregateDeviceUsers(rawUsers).map(u => {
+    const student = students.find(s => String(s.studentDeviceId) === String(u.userId) || String(s.deviceUserId) === String(u.userId));
+    return { ...u, student: student || null };
+  });
+  res.json({ success: true, data: { users: enriched, count: enriched.length } });
+});
+
+// ── POST /api/devices-config/:id/users — add a user to a specific device ──────
+app.post('/api/devices-config/:id/users', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+
+  const userId = String(req.body?.userId || req.body?.studentDeviceId || '').trim();
+  const name   = String(req.body?.name || req.body?.studentName || userId).replace(/\|/g, ' ').trim();
+  if (!userId) return res.status(400).json({ success: false, error: 'User ID is required' });
+
+  const result = await bridge.send(`ADD_USER|${userId}|${name}`, 30000);
+  apiResult(res, result, 201);
+});
+
+// ── DELETE /api/devices-config/:id/users/:userId — delete one user ────────────
+app.delete('/api/devices-config/:id/users/:userId', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+
+  const userId = String(req.params.userId || '').trim();
+  if (!userId) return res.status(400).json({ success: false, error: 'User ID is required' });
+
+  const result = await bridge.send(`DELETE_USER|${userId}`, 30000);
+  apiResult(res, result);
+});
+
+// ── POST /api/devices-config/:id/users/bulk-delete — delete multiple users ────
+// Body: { userIds: string[] }
+app.post('/api/devices-config/:id/users/bulk-delete', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+
+  const userIds = Array.isArray(req.body?.userIds) ? req.body.userIds.map(String) : [];
+  if (!userIds.length) return res.status(400).json({ success: false, error: 'userIds array is required' });
+
+  const deleted = []; const failed = [];
+  for (const userId of userIds) {
+    const r = await bridge.send(`DELETE_USER|${userId}`, 15000);
+    if (r.success) deleted.push(userId); else failed.push({ userId, error: r.error });
+  }
+  res.json({ success: failed.length === 0, deleted: deleted.length, failed: failed.length, failures: failed });
+});
+
+// ── PATCH /api/devices-config/:id/users/:userId — rename a user ───────────────
+// FK623 has no UPDATE command — we delete and re-add with the new name.
+// Body: { name: string }
+app.patch('/api/devices-config/:id/users/:userId', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+
+  const userId  = String(req.params.userId || '').trim();
+  const newName = String(req.body?.name || '').replace(/\|/g, ' ').trim();
+  if (!userId)  return res.status(400).json({ success: false, error: 'User ID is required' });
+  if (!newName) return res.status(400).json({ success: false, error: 'name is required' });
+
+  // Delete biometric data for all backup slots, then re-add with new name
+  await bridge.send(`DELETE_USER|${userId}`, 15000).catch(() => null);
+  const result = await bridge.send(`ADD_USER|${userId}|${newName}`, 30000);
+
+  // Also update local students.json
+  if (result.success) {
+    const idx = students.findIndex(s => String(s.studentDeviceId) === userId || String(s.deviceUserId) === userId);
+    if (idx >= 0) { students[idx].name = newName; students[idx].updatedAt = new Date().toISOString(); saveStudents(); }
+  }
+  apiResult(res, result);
+});
+
+// ── POST /api/devices-config/:id/push-students — push students to one device ──
+// Body: { studentIds?: string[], devPassword: string }
+app.post('/api/devices-config/:id/push-students', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+
+  const ids = Array.isArray(req.body?.studentIds) ? req.body.studentIds : [];
+  const selected = ids.length ? students.filter(s => ids.includes(s.studentId)) : students;
+
+  const pushed = []; const failed = [];
+  for (const student of selected) {
+    const r = await bridge.send(`ADD_USER|${student.studentDeviceId}|${String(student.name).replace(/\|/g, ' ')}`, 30000);
+    if (r.success) pushed.push(student);
+    else {
+      failed.push({ student, error: r.error });
+      if (isNotConnectedError(r.error)) {
+        sseEmit('devicesStatus', { id: req.params.id, connected: false, error: r.error });
+        break;
+      }
+    }
+  }
+  res.json({ success: failed.length === 0, data: { pushed: pushed.length, failed: failed.length, failures: failed } });
+});
+
 app.post('/api/device/pull-logs', requireDevPassword, async (req, res) => {
   if (!currentDevice || !currentDevice.connected) return res.status(503).json({ success: false, error: 'Device is not connected', code: 'device_not_connected' });
   const readMark = req.body?.readMark === 1 || req.query.readMark === '1' ? 1 : 0;
