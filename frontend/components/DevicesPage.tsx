@@ -420,6 +420,19 @@ export default function DevicesPage() {
                       <span className="text-[11px] text-slate-600">lic {d.license}</span>
                       {d.deviceId && <span className="font-mono text-[10px] text-slate-600">{d.deviceId}</span>}
                     </div>
+                    {/* Bridge Device UUID — copy this to paste into the server's device_uid field */}
+                    <div className="flex items-center gap-1.5 mt-1">
+                      <span className="font-mono text-[10px] text-slate-500 select-all" title="Bridge Device UUID — paste this into the server device_uid field">
+                        {d.id}
+                      </span>
+                      <button
+                        onClick={() => { navigator.clipboard.writeText(d.id); }}
+                        title="Copy UUID to clipboard"
+                        className="rounded px-1 py-0.5 text-[9px] border border-slate-700 text-slate-500 hover:text-cyan-400 hover:border-cyan-500/40 transition font-mono"
+                      >
+                        copy
+                      </button>
+                    </div>
                     {/* Live device info strip when connected */}
                     <DeviceInfoStrip info={info} />
                     {/* Error */}
