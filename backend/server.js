@@ -1730,12 +1730,12 @@ app.post('/api/device/connect', async (req, res) => {
   if (result.success) {
     setActiveDeviceSession(result.data);
     if (result.data?.ipAddress) {
-      rememberLatestDeviceIp(result.data.ipAddress, result.data.port || config.port || 5005, {
-        deviceId: result.data.deviceId || config.deviceId || '',
-        license: result.data.license || config.license || 1261,
-        netPassword: result.data.netPassword || config.netPassword || 0,
-        protocolType: result.data.protocolType ?? config.protocolType ?? -1,
-        timeoutMs: result.data.timeoutMs || config.timeoutMs || 15000,
+      rememberLatestDeviceIp(result.data.ipAddress, result.data.port || existingConfig.port || 5005, {
+        deviceId: result.data.deviceId || existingConfig.deviceId || '',
+        license: result.data.license || existingConfig.license || 1261,
+        netPassword: result.data.netPassword || existingConfig.netPassword || 0,
+        protocolType: result.data.protocolType ?? existingConfig.protocolType ?? -1,
+        timeoutMs: result.data.timeoutMs || existingConfig.timeoutMs || 15000,
       });
     }
     autoConnectAttempt = 0;

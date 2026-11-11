@@ -267,9 +267,13 @@ export default function SmartAttendanceDashboard() {
     es.addEventListener("deviceStatus", e => {
       try {
         const s = JSON.parse((e as MessageEvent).data);
-        if (s?.connected === false) {
+        if (s?.connected === true) {
+          // A device (single or multi-device bridge) is connected — update dashboard
+          setConnected(true); setConnectStatus("connected");
+          if (autoConnectRef.current) clearTimeout(autoConnectRef.current);
+        } else if (s?.connected === false && s?.source !== 'bridge-manager') {
+          // Only trigger legacy reconnect for the single-device flow, not bridge-manager devices
           setDevice(null); setConnected(false); setConnectStatus("retrying");
-          toast.error("Device went offline — reconnecting...", { id: "ac" });
           if (autoConnectRef.current) clearTimeout(autoConnectRef.current);
           attemptConnect(0);
         }
@@ -344,16 +348,17 @@ export default function SmartAttendanceDashboard() {
     // Sync per-device status from health poll (catches any updates SSE might have missed)
     if (Array.isArray(data?.registeredDevices) && data.registeredDevices.length > 0) {
       setRegisteredDevices(prev => {
-        // Merge health data into existing list — SSE is the primary source, health is the backup
         const byId = new Map(prev.map(d => [d.id, d]));
         for (const hd of data.registeredDevices) {
           const existing = byId.get(hd.id);
           if (!existing) { byId.set(hd.id, hd); continue; }
-          // Only update if health data is newer than what SSE delivered
           byId.set(hd.id, { ...existing, status: hd.status || existing.status });
         }
         return Array.from(byId.values());
       });
+      // If any registered device is connected, reflect that in the top-level connected state
+      const anyConnected = data.registeredDevices.some((d: any) => d.status?.connected);
+      if (anyConnected) { setConnected(true); setConnectStatus("connected"); }
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -383,13 +388,21 @@ export default function SmartAttendanceDashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectStatus]);
 
-  /* Connect */
+  /* Connect — legacy single-device path.
+   * When registered devices exist the bridge manager handles connections
+   * via SSE — this path is only needed for the legacy single-device flow. */
   async function attemptConnect(attempt: number) {
     if (!mountedRef.current) return;
     const ipAddress = String(deviceFormRef.current.ipAddress || "").trim();
+
+    // If multi-device bridges are handling things, don't spam the "Enter IP" toast.
+    // Just set state to retrying silently and let SSE drive the connected flag.
     if (!ipAddress) {
       setDevice(null); setConnected(false); setConnectStatus("retrying");
-      toast.error("Enter the device IP address and connection details before connecting on the same network.", { id: "ac" });
+      // Only show the "set IP" message on the first attempt, not on every retry
+      if (attempt === 0) {
+        toast("No legacy device IP set — using registered devices", { id: "ac", icon: "ℹ️" });
+      }
       return;
     }
     setConnectAttempt(attempt); setConnectStatus("connecting");
@@ -404,8 +417,9 @@ export default function SmartAttendanceDashboard() {
     } catch {
       if (!mountedRef.current) return;
       setDevice(null); setConnected(false); setConnectStatus("retrying");
-      if (attempt === 0 || attempt % 5 === 0) toast.error("Device unreachable — retrying...", { id: "ac" });
-      autoConnectRef.current = setTimeout(() => attemptConnect(attempt + 1), Math.min(1500 + attempt * 1500, 10000));
+      // Only show the error toast on attempt 0 and every 10th retry — not every 5s
+      if (attempt === 0 || attempt % 10 === 0) toast.error("Device unreachable — retrying...", { id: "ac" });
+      autoConnectRef.current = setTimeout(() => attemptConnect(attempt + 1), Math.min(1500 + attempt * 1500, 15000));
     }
   }
   function scheduleReconnectCheck() {
