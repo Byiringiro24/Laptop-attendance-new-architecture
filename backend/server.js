@@ -2127,6 +2127,49 @@ app.post('/api/devices-config/:id/push-students', requireDevPassword, async (req
   res.json({ success: failed.length === 0, data: { pushed: pushed.length, failed: failed.length, failures: failed } });
 });
 
+// ── POST /api/devices-config/:id/pull-logs — pull logs from a specific device ──
+// Treats each FK623 device independently — logs are keyed to this device's bridge.
+// Body: { readMark?: number }
+app.post('/api/devices-config/:id/pull-logs', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+
+  const readMark = req.body?.readMark === 1 || req.query.readMark === '1' ? 1 : 0;
+  let result = await bridge.send(`GET_LOGS|${readMark}`, 90000);
+
+  // Fallback: if readMark=1 returns nothing, re-fetch all logs
+  if (result.success && (result.data?.logs || []).length === 0 && readMark === 1) {
+    result = await bridge.send('GET_LOGS|0', 90000);
+  }
+
+  if (!result.success && bridge._isOfflineError(result.error)) {
+    sseEmit('devicesStatus', { id: req.params.id, connected: false, error: result.error, source: 'pull-logs' });
+    return res.status(503).json({ ...result, code: 'device_not_connected' });
+  }
+
+  res.json(result);
+});
+
+// ── POST /api/devices-config/:id/clear-logs — clear logs on a specific device ──
+app.post('/api/devices-config/:id/clear-logs', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+  const result = await bridge.send('CLEAR_LOGS', 30000);
+  res.json(result);
+});
+
+// ── POST /api/devices-config/:id/sync-time — sync clock on a specific device ──
+app.post('/api/devices-config/:id/sync-time', requireDevPassword, async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
+  const now = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+  const result = await bridge.send(`SET_TIME|${now}`, 10000);
+  res.json(result);
+});
+
 app.post('/api/device/pull-logs', requireDevPassword, async (req, res) => {
   if (!currentDevice || !currentDevice.connected) return res.status(503).json({ success: false, error: 'Device is not connected', code: 'device_not_connected' });
   const readMark = req.body?.readMark === 1 || req.query.readMark === '1' ? 1 : 0;
