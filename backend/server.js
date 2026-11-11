@@ -2128,9 +2128,8 @@ app.post('/api/devices-config/:id/push-students', requireDevPassword, async (req
 });
 
 // ── POST /api/devices-config/:id/pull-logs — pull logs from a specific device ──
-// Treats each FK623 device independently — logs are keyed to this device's bridge.
-// Body: { readMark?: number }
-app.post('/api/devices-config/:id/pull-logs', requireDevPassword, async (req, res) => {
+// No dev password required — this is called automatically by the server pull-logs job.
+app.post('/api/devices-config/:id/pull-logs', async (req, res) => {
   const bridge = bridgeManager.get(req.params.id);
   if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
   if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
@@ -2170,7 +2169,7 @@ app.post('/api/devices-config/:id/sync-time', requireDevPassword, async (req, re
   res.json(result);
 });
 
-app.post('/api/device/pull-logs', requireDevPassword, async (req, res) => {
+app.post('/api/device/pull-logs', async (req, res) => {
   if (!currentDevice || !currentDevice.connected) return res.status(503).json({ success: false, error: 'Device is not connected', code: 'device_not_connected' });
   const readMark = req.body?.readMark === 1 || req.query.readMark === '1' ? 1 : 0;
   let result = await sendCommand(`GET_LOGS|${readMark}`, 90000);
