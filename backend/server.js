@@ -2250,7 +2250,7 @@ app.get('/api/devices-config/:id/ping', async (req, res) => {
       connected: false,
       fk623Reachable: false,
       bridgeReady: true,
-      message: (err as Error).message || 'Ping failed',
+      message: (err instanceof Error ? err.message : String(err)) || 'Ping failed',
       deviceId: req.params.id,
     });
   }
