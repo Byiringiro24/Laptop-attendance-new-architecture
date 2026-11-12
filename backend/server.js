@@ -2193,6 +2193,69 @@ app.post('/api/devices-config/:id/sync-time', requireDevPassword, async (req, re
   res.json(result);
 });
 
+// ── GET /api/devices-config/:id/ping — ping FK623 device via its bridge ──────
+// The bridge sends a STATUS command to the FK623 and returns whether it is
+// reachable on the school LAN. This is the per-device equivalent of /api/health.
+// No dev password required — this is a read-only connectivity check.
+app.get('/api/devices-config/:id/ping', async (req, res) => {
+  const bridge = bridgeManager.get(req.params.id);
+  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found', connected: false });
+
+  // If the bridge process is not even running/ready, FK623 is unreachable
+  if (!bridge._ready) {
+    return res.json({
+      success: true,
+      connected: false,
+      fk623Reachable: false,
+      bridgeReady: false,
+      message: 'Bridge process not ready',
+      deviceId: req.params.id,
+    });
+  }
+
+  try {
+    // Send STATUS command — FK623 SDK checks TCP connection to the device
+    const result = await bridge.send('STATUS', 5000);
+    const fk623Connected = result.success && Boolean(result.data?.connected);
+    const deviceInfo = result.data || {};
+
+    // Update the bridge's internal connected state so SSE reflects this
+    if (result.success) {
+      bridge.connected = fk623Connected;
+      bridge.deviceInfo = deviceInfo;
+    }
+
+    res.json({
+      success: true,
+      connected: fk623Connected,
+      fk623Reachable: fk623Connected,
+      bridgeReady: true,
+      bridgeConnected: bridge.connected,
+      deviceInfo: fk623Connected ? {
+        deviceId:    deviceInfo.deviceId,
+        serialNumber: deviceInfo.serialNumber,
+        users:       deviceInfo.deviceUserCount ?? deviceInfo.users ?? 0,
+        logs:        deviceInfo.logCount        ?? deviceInfo.logs  ?? 0,
+        productName: deviceInfo.productName,
+        ipAddress:   deviceInfo.ipAddress,
+      } : null,
+      message: fk623Connected
+        ? 'FK623 is connected and responding'
+        : (result.error || 'FK623 not reachable on local network'),
+      deviceId: req.params.id,
+    });
+  } catch (err) {
+    res.json({
+      success: true,
+      connected: false,
+      fk623Reachable: false,
+      bridgeReady: true,
+      message: (err as Error).message || 'Ping failed',
+      deviceId: req.params.id,
+    });
+  }
+});
+
 app.post('/api/device/pull-logs', async (req, res) => {
   if (!currentDevice || !currentDevice.connected) return res.status(503).json({ success: false, error: 'Device is not connected', code: 'device_not_connected' });
   const readMark = req.body?.readMark === 1 || req.query.readMark === '1' ? 1 : 0;
