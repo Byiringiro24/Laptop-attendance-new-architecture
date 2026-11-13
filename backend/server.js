@@ -4068,12 +4068,28 @@ function onDeviceStatus(deviceId, status) {
 // Create the manager — it will be populated when devices are loaded at startup
 const bridgeManager = new DeviceBridgeManager(dataDir, onDeviceLog, onDeviceStatus);
 
-/** Load all registered devices and start a bridge for each one */
+/** Load all registered devices and start a bridge for each one.
+ * Staggered startup for 100+ devices — avoids overwhelming the OS
+ * by starting bridges in batches of 20 with a 200ms delay between batches.
+ */
 async function startAllDeviceBridges() {
   const list = loadDevicesList();
   if (!list.length) return;
   console.log(`[bridge-mgr] Starting bridges for ${list.length} device(s)...`);
-  await Promise.all(list.map(d => bridgeManager.upsert(d)));
+
+  // Start in batches of 20 — prevents port exhaustion and CPU spikes on large fleets
+  const BATCH_SIZE = 20;
+  const BATCH_DELAY_MS = 200;
+  for (let i = 0; i < list.length; i += BATCH_SIZE) {
+    const batch = list.slice(i, i + BATCH_SIZE);
+    await Promise.all(batch.map(d => bridgeManager.upsert(d).catch(err =>
+      console.warn(`[bridge-mgr] start failed for ${d.name}:`, err.message)
+    )));
+    if (i + BATCH_SIZE < list.length) {
+      await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+    }
+  }
+  console.log(`[bridge-mgr] All ${list.length} bridge(s) started`);
 }
 
 function getDevicesWithStatus() {
