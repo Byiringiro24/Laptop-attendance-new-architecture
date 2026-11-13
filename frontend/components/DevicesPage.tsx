@@ -20,6 +20,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import {
   FiPlus, FiTrash2, FiEdit2, FiZap, FiZapOff,
+  FiLock,
   FiSearch, FiUploadCloud, FiRefreshCw, FiX,
   FiWifi, FiWifiOff, FiMapPin, FiCpu, FiAlertTriangle,
   FiCheckCircle, FiLoader, FiDownload, FiUsers, FiDatabase,
@@ -148,6 +149,32 @@ export default function DevicesPage() {
   const [deleteId, setDeleteId]     = useState<string | null>(null);
   const [deleting, setDeleting]     = useState(false);
 
+  // Dev password gate — required for edit/delete operations
+  const [devPw, setDevPw]           = useState("");
+  const [devPwInput, setDevPwInput] = useState("");
+  const [devPwOpen, setDevPwOpen]   = useState(false);
+  const [devPwError, setDevPwError] = useState("");
+  const [devPwPending, setDevPwPending] = useState<(() => void) | null>(null);
+
+  // Verify dev password with the bridge then run the pending action
+  const unlockAndRun = async (action: () => void) => {
+    setDevPwPending(() => action);
+    if (devPw) { action(); return; } // already unlocked this session
+    setDevPwInput(""); setDevPwError(""); setDevPwOpen(true);
+  };
+  const submitDevPw = async () => {
+    if (!devPwInput.trim()) { setDevPwError("Enter the developer password"); return; }
+    try {
+      const r = await fetch(`${API_BASE}/api/device/status`, {
+        headers: { "X-Dev-Password": devPwInput.trim() },
+      });
+      if (r.status === 401) { setDevPwError("Incorrect password"); return; }
+      setDevPw(devPwInput.trim());
+      setDevPwOpen(false);
+      devPwPending?.();
+    } catch { setDevPwError("Could not verify — check bridge is running"); }
+  };
+
   const sseRef     = useRef<EventSource | null>(null);
   const mountedRef = useRef(true);
 
@@ -238,10 +265,12 @@ export default function DevicesPage() {
     setEditId(null); setForm(emptyForm); setFormErr(""); setModalOpen(true);
   }
   function openEdit(d: BiometricDevice) {
-    setEditId(d.id);
-    setForm({ name: d.name, ipAddress: d.ipAddress, port: d.port, license: d.license,
-               deviceId: d.deviceId, location: d.location, notes: d.notes, timeoutMs: d.timeoutMs });
-    setFormErr(""); setModalOpen(true);
+    unlockAndRun(() => {
+      setEditId(d.id);
+      setForm({ name: d.name, ipAddress: d.ipAddress, port: d.port, license: d.license,
+                 deviceId: d.deviceId, location: d.location, notes: d.notes, timeoutMs: d.timeoutMs });
+      setFormErr(""); setModalOpen(true);
+    });
   }
   function closeModal() { setModalOpen(false); setEditId(null); setFormErr(""); }
 
@@ -474,7 +503,7 @@ export default function DevicesPage() {
                       <FiEdit2 className="text-sm" />
                     </button>
                     {/* Delete */}
-                    <button onClick={() => setDeleteId(d.id)} title="Delete"
+                    <button onClick={() => unlockAndRun(() => setDeleteId(d.id))} title="Delete"
                       className="rounded-lg p-1.5 text-slate-500 hover:bg-red-500/15 hover:text-red-400 transition">
                       <FiTrash2 className="text-sm" />
                     </button>
@@ -631,22 +660,37 @@ export default function DevicesPage() {
         </div>
       )}
 
-      {/* ══ DELETE CONFIRM ════════════════════════════════ */}
-      {deleteId && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+      {/* ══ DEV PASSWORD GATE ════════════════════════════ */}
+      {devPwOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
           <div className="w-full max-w-sm rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl p-5 space-y-4">
-            <h2 className="text-sm font-bold text-white">Remove Device?</h2>
+            <div className="flex items-center gap-2">
+              <FiLock className="text-cyan-400 shrink-0" />
+              <h2 className="text-sm font-bold text-white">Developer Password Required</h2>
+            </div>
             <p className="text-xs text-slate-400">
-              This removes <strong className="text-white">{devices.find(d => d.id === deleteId)?.name}</strong>{" "}
-              from the list and stops its bridge process. The physical device is not affected.
+              This operation requires the developer password set on the bridge to prevent accidental changes.
             </p>
+            <div className="space-y-2">
+              <input
+                type="password"
+                value={devPwInput}
+                onChange={e => setDevPwInput(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && submitDevPw()}
+                placeholder="Enter developer password"
+                autoFocus
+                className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500/60"
+              />
+              {devPwError && <p className="text-xs text-red-400">{devPwError}</p>}
+            </div>
             <div className="flex gap-2">
-              <button onClick={() => setDeleteId(null)}
-                className="flex-1 rounded-xl border border-slate-700 py-2 text-sm text-slate-400 hover:text-white transition">Cancel</button>
-              <button onClick={confirmDelete} disabled={deleting}
-                className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-red-600 hover:bg-red-500 py-2 text-sm font-semibold text-white transition disabled:opacity-50">
-                {deleting ? <FiLoader className="animate-spin" /> : <FiTrash2 />}
-                {deleting ? "Removing…" : "Remove"}
+              <button onClick={() => setDevPwOpen(false)}
+                className="flex-1 rounded-xl border border-slate-700 py-2 text-sm text-slate-400 hover:text-white transition">
+                Cancel
+              </button>
+              <button onClick={submitDevPw}
+                className="flex-1 rounded-xl bg-cyan-600 hover:bg-cyan-500 py-2 text-sm font-semibold text-white transition">
+                Unlock
               </button>
             </div>
           </div>
@@ -655,3 +699,4 @@ export default function DevicesPage() {
     </div>
   );
 }
+
