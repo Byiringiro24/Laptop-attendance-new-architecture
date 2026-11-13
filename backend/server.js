@@ -3959,7 +3959,8 @@ const deviceStatusMap = new Map();
 
 /**
  * Called by each DeviceBridge when new attendance logs arrive from its device.
- * Merges them into the global logsCache and emits over SSE — same path as single-device poll.
+ * Merges them into the global logsCache, emits over SSE, AND auto-pushes to
+ * the school server immediately if a school auth token is available.
  */
 function onDeviceLog(deviceId, deviceConfig, newLogs) {
   if (!Array.isArray(newLogs) || !newLogs.length) return;
@@ -3980,6 +3981,36 @@ function onDeviceLog(deviceId, deviceConfig, newLogs) {
     logsCache = [...logsCache, ...truly_new].slice(-5000); // keep last 5000
     sseEmit('attendance', truly_new);
     console.log(`[bridge-mgr:${deviceConfig.name || deviceId.slice(0,8)}] ${truly_new.length} new log(s) emitted`);
+
+    // ── Auto-push to school server immediately ───────────────────────────
+    // Push each new log to the school server as it arrives so the server
+    // has real-time data without waiting for a manual push or the server
+    // pull-logs job. Fire-and-forget — never block the log poll cycle.
+    if (schoolAuthToken) {
+      setImmediate(async () => {
+        let pushed = 0, failed = 0;
+        for (const log of truly_new) {
+          const payload = {
+            log_id:                String(log.id || ''),
+            user_id:               String(log.deviceUserId || log.userId || ''),
+            timestamp:             log.timestamp || new Date().toISOString(),
+            authentication_method: log.scanMethod || log.method || 'fingerprint',
+            direction:             log.direction || 'In',
+            device_id:             String(log.deviceId || deviceConfig.deviceId || deviceId),
+            raw_data:              log,
+          };
+          try {
+            const { status: s } = await relayToServer('POST', '/gate/logs', payload, schoolAuthToken);
+            if (s >= 200 && s < 300) pushed++; else failed++;
+          } catch { failed++; }
+        }
+        if (pushed > 0 || failed > 0) {
+          console.log(`[bridge-mgr:${deviceConfig.name || deviceId.slice(0,8)}] auto-pushed ${pushed} log(s) to server${failed ? `, ${failed} failed` : ''}`);
+        }
+      });
+    } else {
+      console.log(`[bridge-mgr:${deviceConfig.name || deviceId.slice(0,8)}] ${truly_new.length} log(s) cached locally — not logged in to school server`);
+    }
   }
 }
 
