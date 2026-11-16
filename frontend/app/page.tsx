@@ -408,14 +408,11 @@ export default function SmartAttendanceDashboard() {
     if (!mountedRef.current) return;
     const ipAddress = String(deviceFormRef.current.ipAddress || "").trim();
 
-    // If multi-device bridges are handling things, don't spam the "Enter IP" toast.
-    // Just set state to retrying silently and let SSE drive the connected flag.
+    // No legacy IP — multi-device bridge manager handles connections via SSE.
+    // Simply wait — SSE devicesStatus events will update connected state automatically.
     if (!ipAddress) {
-      setDevice(null); setConnected(false); setConnectStatus("retrying");
-      // Only show the "set IP" message on the first attempt, not on every retry
-      if (attempt === 0) {
-        toast("No legacy device IP set — using registered devices", { id: "ac", icon: "ℹ️" });
-      }
+      setDevice(null);
+      // Don't set connectStatus to "retrying" — let bridge-manager SSE drive it
       return;
     }
     setConnectAttempt(attempt); setConnectStatus("connecting");
@@ -523,12 +520,21 @@ export default function SmartAttendanceDashboard() {
       setBusy(true);
       try {
         const res = await deviceApi.pullLogs(readMode, pw);
-        if (res.data) {
-          const pulled = (res.data as AttendanceLog[]).filter(l => !knownLogIds.current.has(l.id));
-          pulled.forEach(l => knownLogIds.current.add(l.id));
-          setLogs(p => [...pulled, ...p].slice(0, 500));
-          toast.success(`Pulled ${pulled.length} new log${pulled.length !== 1 ? "s" : ""}`);
-        }
+        // Bridge returns { success, data: { logs: [...] } } or { success, logs: [...] }
+        const raw = res.data as any;
+        const logsArray: AttendanceLog[] = Array.isArray(raw)
+          ? raw
+          : Array.isArray(raw?.data)
+            ? raw.data
+            : Array.isArray(raw?.logs)
+              ? raw.logs
+              : Array.isArray(raw?.data?.logs)
+                ? raw.data.logs
+                : [];
+        const pulled = logsArray.filter(l => !knownLogIds.current.has(l.id));
+        pulled.forEach(l => knownLogIds.current.add(l.id));
+        setLogs(p => [...pulled, ...p].slice(0, 500));
+        toast.success(`Pulled ${pulled.length} new log${pulled.length !== 1 ? "s" : ""}`);
       } catch (e: any) { handleDeviceError(e, "Pull logs failed"); }
       finally { setBusy(false); }
     });

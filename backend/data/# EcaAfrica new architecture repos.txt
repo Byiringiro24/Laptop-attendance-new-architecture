@@ -1,0 +1,7 @@
+﻿# EcaAfrica new architecture repos
+
+## Backend
+- https://github.com/Byiringiro24/Ecaafrica-New-Architecture-Backend.git
+
+## Frontend
+- https://github.com/Byiringiro24/Ecaafrica-New-Architecture-Frontend.git
