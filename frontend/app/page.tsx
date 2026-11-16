@@ -886,15 +886,21 @@ export default function SmartAttendanceDashboard() {
             <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search logs..." autoComplete="off"
               className="mb-2 w-full rounded-xl border border-slate-700 bg-slate-800 px-2.5 py-2 text-xs text-slate-100 outline-none placeholder:text-slate-600 focus:border-cyan-400 shrink-0" />
             <div className="flex-1 overflow-y-auto space-y-1 min-h-0">
-              {filteredLogs.slice(0, 50).map(l => (
-                <div key={l.id} className="rounded-lg border border-slate-800 bg-slate-800/50 p-2 text-xs">
-                  <div className="flex items-center justify-between gap-1">
-                    <span className="font-semibold truncate">{l.studentName}</span>
-                    <StatusPill status={l.status} small />
+              {filteredLogs.slice(0, 50).map((l, idx) => {
+                // Handle both AttendanceLog format and raw FK623 log format
+                const name = (l as any).studentName || (l as any).name || `User ${(l as any).userId || (l as any).user_id || "?"}`;
+                const time = (l as any).timestamp || (l as any).scanTime || (l as any).scan_time || "";
+                const status = (l as any).status || ((l as any).inOutMode === 1 ? "exit" : "present");
+                return (
+                  <div key={(l as any).id || `log-${idx}`} className="rounded-lg border border-slate-800 bg-slate-800/50 p-2 text-xs">
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="font-semibold truncate">{String(name)}</span>
+                      <StatusPill status={typeof status === "string" ? status : "present"} small />
+                    </div>
+                    <p className="text-slate-500 text-[10px]">{time ? new Date(time).toLocaleTimeString() : "—"}</p>
                   </div>
-                  <p className="text-slate-500 text-[10px]">{new Date(l.timestamp).toLocaleTimeString()}</p>
-                </div>
-              ))}
+                );
+              })}
               {filteredLogs.length === 0 && <p className="py-4 text-center text-xs text-slate-600">No logs yet</p>}
             </div>
           </div>
@@ -1225,19 +1231,19 @@ export default function SmartAttendanceDashboard() {
                       </div>
                     )}
                     <div className="grid grid-cols-3 gap-2">
-                    <button onClick={pullUsers} disabled={busy || !connected} className="secondary-action py-2.5 text-xs text-center touch-manipulation flex flex-col items-center gap-0.5">
-                      <FiUsers className="text-sm" /><span>Get Users</span>
-                    </button>
-                    <button onClick={syncTime} disabled={busy || !connected} className="secondary-action py-2.5 text-xs text-center touch-manipulation flex flex-col items-center gap-0.5">
-                      <FiZap className="text-sm" /><span>Sync Time</span>
-                    </button>
-                    <button onClick={pullLogs} disabled={busy || !connected} className="secondary-action py-2.5 text-xs text-center touch-manipulation flex flex-col items-center gap-0.5">
-                      <FiDownloadCloud className="text-sm" /><span>Pull Logs</span>
-                    </button>
+                      <button onClick={pullUsers} disabled={busy || !connected} className="secondary-action py-2.5 text-xs text-center touch-manipulation flex flex-col items-center gap-0.5">
+                        <FiUsers className="text-sm" /><span>Get Users</span>
+                      </button>
+                      <button onClick={syncTime} disabled={busy || !connected} className="secondary-action py-2.5 text-xs text-center touch-manipulation flex flex-col items-center gap-0.5">
+                        <FiZap className="text-sm" /><span>Sync Time</span>
+                      </button>
+                      <button onClick={pullLogs} disabled={busy || !connected} className="secondary-action py-2.5 text-xs text-center touch-manipulation flex flex-col items-center gap-0.5">
+                        <FiDownloadCloud className="text-sm" /><span>Pull Logs</span>
+                      </button>
+                    </div>
                   </div>
 
-                    
-                {/* Device users quick list */}
+                  {/* Device users quick list */}
                   {deviceUsers.length > 0 && (
                     <div className="mt-4 border-t border-slate-800 pt-3">
                       <div className="flex items-center justify-between mb-2">
@@ -1304,6 +1310,9 @@ export default function SmartAttendanceDashboard() {
               </div>
             </div>
           </div>
+        </div>
+        </div>
+        </div>
         )}
       </main>
 
@@ -1680,6 +1689,7 @@ export default function SmartAttendanceDashboard() {
           onCopy={copyToClipboard}
         />
       )}
+    </div>
     </div>
   );
 }
