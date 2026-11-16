@@ -297,7 +297,10 @@ export default function DevicesPage() {
     if (!deleteId) return;
     setDeleting(true);
     try {
-      const r = await fetch(`${API_BASE}/api/devices-config/${deleteId}`, { method: "DELETE" });
+      const r = await fetch(`${API_BASE}/api/devices-config/${deleteId}`, {
+        method: "DELETE",
+        headers: devPw ? { "X-Dev-Password": devPw } : {},
+      });
       const d = await r.json();
       if (d.success) {
         toast.success("Device removed and bridge stopped");

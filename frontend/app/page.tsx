@@ -129,6 +129,9 @@ export default function SmartAttendanceDashboard() {
   // ── Registered biometric devices (persisted in backend data/devices-list.json) ──
   const [registeredDevices, setRegisteredDevices] = useState<RegisteredDevice[]>([]);
   const [deviceBusy, setDeviceBusy] = useState<Set<string>>(new Set());
+  // selectedRegisteredDeviceId: which FK623 to target for Get Users / Pull Logs / Sync Time
+  // null = use all / first connected device (legacy path)
+  const [selectedRegisteredDeviceId, setSelectedRegisteredDeviceId] = useState<string | null>(null);
 
   const loadRegisteredDevices = async () => {
     try {
@@ -434,6 +437,9 @@ export default function SmartAttendanceDashboard() {
   }
   function scheduleReconnectCheck() {
     if (autoConnectRef.current) clearTimeout(autoConnectRef.current);
+    // Only run legacy single-device health checks if no registered multi-devices exist
+    // — when multi-device bridges are running, SSE drives the connected state
+    if (registeredDevices.length > 0) return;
     autoConnectRef.current = setTimeout(async () => {
       if (!mountedRef.current) return;
       try { await deviceApi.getStatus(); scheduleReconnectCheck(); }
@@ -519,18 +525,24 @@ export default function SmartAttendanceDashboard() {
     withDevAuth(async (pw) => {
       setBusy(true);
       try {
-        const res = await deviceApi.pullLogs(readMode, pw);
-        // Bridge returns { success, data: { logs: [...] } } or { success, logs: [...] }
-        const raw = res.data as any;
-        const logsArray: AttendanceLog[] = Array.isArray(raw)
-          ? raw
-          : Array.isArray(raw?.data)
-            ? raw.data
-            : Array.isArray(raw?.logs)
-              ? raw.logs
-              : Array.isArray(raw?.data?.logs)
-                ? raw.data.logs
-                : [];
+        const targetId = selectedRegisteredDeviceId
+          || registeredDevices.find(d => d.status?.connected)?.id || null;
+        let logsArray: AttendanceLog[] = [];
+        if (targetId) {
+          const r = await fetch(`${API_BASE}/api/devices-config/${targetId}/pull-logs`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ readMark }),
+          });
+          const json = await r.json();
+          logsArray = Array.isArray(json?.data?.logs) ? json.data.logs
+            : Array.isArray(json?.logs) ? json.logs
+            : Array.isArray(json?.data) ? json.data : [];
+        } else {
+          const res = await deviceApi.pullLogs(readMode, pw);
+          const raw = res.data as any;
+          logsArray = Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data
+            : Array.isArray(raw?.logs) ? raw.logs : Array.isArray(raw?.data?.logs) ? raw.data.logs : [];
+        }
         const pulled = logsArray.filter(l => !knownLogIds.current.has(l.id));
         pulled.forEach(l => knownLogIds.current.add(l.id));
         setLogs(p => [...pulled, ...p].slice(0, 500));
@@ -539,30 +551,43 @@ export default function SmartAttendanceDashboard() {
       finally { setBusy(false); }
     });
   }
-
   async function pullUsers() {
     withDevAuth(async (pw) => {
       setBusy(true);
       try {
-        const res = await deviceApi.getUsers(pw);
-        const raw = res.data as any;
-        const list: DeviceUser[] = Array.isArray(raw) ? raw : raw?.data ?? raw?.users ?? [];
+        const targetId = selectedRegisteredDeviceId
+          || registeredDevices.find(d => d.status?.connected)?.id || null;
+        let list: DeviceUser[] = [];
+        if (targetId) {
+          const r = await fetch(`${API_BASE}/api/devices-config/${targetId}/users`, { headers: { "X-Dev-Password": pw } });
+          const json = await r.json();
+          const raw = json?.data?.users || json?.data || json?.users || [];
+          list = Array.isArray(raw) ? raw : [];
+        } else {
+          const res = await deviceApi.getUsers(pw);
+          const raw = res.data as any;
+          list = Array.isArray(raw) ? raw : raw?.data ?? raw?.users ?? [];
+        }
         setDeviceUsers(list);
         toast.success(`Loaded ${list.length} device user${list.length !== 1 ? "s" : ""}`);
       } catch (e: any) { handleDeviceError(e, "Get users failed"); }
       finally { setBusy(false); }
     });
   }
-
   async function syncTime() {
     withDevAuth(async (pw) => {
       setBusy(true);
-      try { await deviceApi.syncTime(pw); toast.success("Device time synced"); }
-      catch (e: any) { handleDeviceError(e, "Sync time failed"); }
+      try {
+        const targetId = selectedRegisteredDeviceId
+          || registeredDevices.find(d => d.status?.connected)?.id || null;
+        if (targetId) {
+          await fetch(`${API_BASE}/api/devices-config/${targetId}/sync-time`, { method: "POST", headers: { "X-Dev-Password": pw } });
+        } else { await deviceApi.syncTime(pw); }
+        toast.success("Device time synced");
+      } catch (e: any) { handleDeviceError(e, "Sync time failed"); }
       finally { setBusy(false); }
     });
   }
-
   async function pushStudents() {
     withDevAuth(async (pw) => {
       setBusy(true);
@@ -1181,7 +1206,25 @@ export default function SmartAttendanceDashboard() {
                   )}
 
                   {/* Action buttons for active connection */}
-                  <div className="grid grid-cols-3 gap-2">
+                  <div className="space-y-2">
+                    {/* Selected device indicator */}
+                    {registeredDevices.length > 0 && (
+                      <div className="flex items-center gap-2 rounded-lg bg-slate-800/60 border border-slate-700 px-3 py-2 text-xs">
+                        <span className="text-slate-500">Commands target:</span>
+                        <span className="font-semibold text-cyan-300">
+                          {selectedRegisteredDeviceId
+                            ? (registeredDevices.find(d => d.id === selectedRegisteredDeviceId)?.name ?? selectedRegisteredDeviceId)
+                            : registeredDevices.find(d => d.status?.connected)?.name
+                              ? `${registeredDevices.find(d => d.status?.connected)?.name} (auto)`
+                              : "No device connected"}
+                        </span>
+                        {selectedRegisteredDeviceId && (
+                          <button onClick={() => setSelectedRegisteredDeviceId(null)}
+                            className="ml-auto text-[10px] text-slate-500 hover:text-white">✕ clear</button>
+                        )}
+                      </div>
+                    )}
+                    <div className="grid grid-cols-3 gap-2">
                     <button onClick={pullUsers} disabled={busy || !connected} className="secondary-action py-2.5 text-xs text-center touch-manipulation flex flex-col items-center gap-0.5">
                       <FiUsers className="text-sm" /><span>Get Users</span>
                     </button>
@@ -1193,7 +1236,8 @@ export default function SmartAttendanceDashboard() {
                     </button>
                   </div>
 
-                  {/* Device users quick list */}
+                    
+                {/* Device users quick list */}
                   {deviceUsers.length > 0 && (
                     <div className="mt-4 border-t border-slate-800 pt-3">
                       <div className="flex items-center justify-between mb-2">
@@ -1639,3 +1683,7 @@ export default function SmartAttendanceDashboard() {
     </div>
   );
 }
+
+
+
+
