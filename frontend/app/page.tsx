@@ -1310,9 +1310,9 @@ export default function SmartAttendanceDashboard() {
               </div>
             </div>
           </div>
-        </div>
-        </div>
-        </div>
+          </div>
+          </div>
+          </div>
         )}
       </main>
 
@@ -1690,7 +1690,7 @@ export default function SmartAttendanceDashboard() {
         />
       )}
     </div>
-    </div>
+  </div>
   );
 }
 
