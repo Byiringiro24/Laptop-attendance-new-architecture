@@ -1,5 +1,5 @@
 # ── Build artifacts ───────────────────────────────────────────────────────────
-FKBridge/bin/
+# FKBridge/bin IS committed (pre-built exe + DLLs needed on every new machine)
 FKBridge/obj/
 
 # ── Node.js ───────────────────────────────────────────────────────────────────
