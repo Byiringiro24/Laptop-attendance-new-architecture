@@ -1312,7 +1312,6 @@ export default function SmartAttendanceDashboard() {
           </div>
         </div>
       </div>
-    </div>
       )}
       </main>
 
