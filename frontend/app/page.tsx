@@ -1313,7 +1313,7 @@ export default function SmartAttendanceDashboard() {
         </div>
       </div>
     </div>
-        )}
+      )}
       </main>
 
       {/* ══ SCHOOL LOGIN MODAL ═══════════════════════════════ */}
