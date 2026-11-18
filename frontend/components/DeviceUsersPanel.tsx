@@ -20,7 +20,7 @@ import {
   FiUsers, FiX, FiRefreshCw, FiSearch, FiFilter,
   FiCheckCircle, FiXCircle, FiAlertCircle, FiDownloadCloud,
   FiCpu, FiUserCheck, FiActivity, FiLock, FiEye, FiEyeOff,
-  FiTrash2, FiEdit2, FiUploadCloud, FiLoader, FiChevronDown,
+  FiTrash2, FiEdit2, FiUploadCloud, FiLoader, FiChevronDown, FiAlertTriangle,
 } from "react-icons/fi";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";

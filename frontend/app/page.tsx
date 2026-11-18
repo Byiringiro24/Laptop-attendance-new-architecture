@@ -115,7 +115,7 @@ export default function SmartAttendanceDashboard() {
   const sseReconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoConnectRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef      = useRef(true);
-  const [connectStatus,  setConnectStatus]  = useState<"connecting"|"connected"|"retrying">("connecting");
+  const [connectStatus,  setConnectStatus]  = useState<"connecting"|"connected"|"retrying"|"offline">("connecting");
   const [connectAttempt, setConnectAttempt] = useState(0);
 
   const [tabletName,        setTabletName]        = useState<string | null>(null);
@@ -531,7 +531,7 @@ export default function SmartAttendanceDashboard() {
         if (targetId) {
           const r = await fetch(`${API_BASE}/api/devices-config/${targetId}/pull-logs`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ readMark }),
+            body: JSON.stringify({ readMark: 0 }),
           });
           const json = await r.json();
           logsArray = Array.isArray(json?.data?.logs) ? json.data.logs
@@ -1310,9 +1310,7 @@ export default function SmartAttendanceDashboard() {
               </div>
             </div>
           </div>
-        </div>
-      </div>
-      )}
+        )}
       </main>
 
       {/* ══ SCHOOL LOGIN MODAL ═══════════════════════════════ */}

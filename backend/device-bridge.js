@@ -196,8 +196,9 @@ class DeviceBridge {
     const { command, timeoutMs, resolve } = this._queue.shift();
     try {
       const result = await this._sendRaw(command, timeoutMs);
-      // FK -3 recovery: device disconnected mid-command
-      const isDisconnect = !result.success && (
+      // FK -3 from GET_LOGS means the device has no new scans; it is not a disconnect.
+      const noNewLogs = command.startsWith('GET_LOGS') && this._isNoNewLogsError(result.error);
+      const isDisconnect = !result.success && !noNewLogs && (
         String(result.error || '').includes('-3') ||
         String(result.error || '').toLowerCase().includes('not connected') ||
         String(result.error || '').toLowerCase().includes('loadgenerallog')
@@ -362,6 +363,7 @@ class DeviceBridge {
     try {
       const result = await this.send('GET_LOGS|0', 15000);
       if (!result.success) {
+        if (this._isNoNewLogsError(result.error)) return;
         const offline = this._isOfflineError(result.error);
         if (offline) {
           console.log(`[bridge:${this._label()}] log poll — device offline`);
@@ -433,6 +435,11 @@ class DeviceBridge {
     if (!this._destroyed) {
       this._autoReconnectTimer = setTimeout(() => this._autoConnect(), 3000);
     }
+  }
+
+  _isNoNewLogsError(err = '') {
+    const message = String(err).toLowerCase();
+    return message.includes('-3') || message.includes('no new logs') || message.includes('no logs');
   }
 
   _isOfflineError(err = '') {

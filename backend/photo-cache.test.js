@@ -25,13 +25,13 @@ test('buildPhotoCacheManifest scopes cache entries by room and student', () => {
   assert.equal(result[0].photoUrl, '/uploads/student-101.jpg');
 });
 
-test('shouldRefreshPhotoCache returns true after the 5 minute TTL', () => {
+test('shouldRefreshPhotoCache returns true after the 7 day TTL', () => {
   const now = Date.now();
   const staleEntry = {
     studentId: 's-101',
     roomKey: 'dorm-3',
     deviceId: 'tablet-01',
-    updatedAt: now - (6 * 60 * 1000),
+    updatedAt: now - (8 * 24 * 60 * 60 * 1000),
   };
 
   assert.equal(shouldRefreshPhotoCache(staleEntry, now), true);
@@ -45,11 +45,13 @@ test('resolveLocalPhotoPath keeps the room-scoped cache structure predictable', 
 });
 
 test('buildPhotoCacheSyncPlan removes stale files and flags changed photos', () => {
-  const rootPath = 'C:/tmp/eca-photo-cache-sync-plan';
+  fs.mkdirSync(path.join(__dirname, '.tmp'), { recursive: true });
+  const tempRoot = fs.mkdtempSync(path.join(__dirname, '.tmp', 'photo-cache-sync-plan-'));
   const roomKey = 'dorm-3';
   const staleStudentId = 'old-student';
   const changedStudentId = 's-101';
-  const roomDir = path.join(rootPath, roomKey).replace(/[\\/]+/g, path.sep);
+  const rootPath = tempRoot;
+  const roomDir = path.join(rootPath, roomKey);
 
   fs.mkdirSync(roomDir, { recursive: true });
   fs.writeFileSync(path.join(roomDir, `${staleStudentId}.jpg`), 'stale');
@@ -74,5 +76,5 @@ test('buildPhotoCacheSyncPlan removes stale files and flags changed photos', () 
   assert.equal(plan.keep.length, 0);
   assert.equal(plan.roomKey, roomKey);
 
-  fs.rmSync(roomDir, { recursive: true, force: true });
+  fs.rmSync(tempRoot, { recursive: true, force: true });
 });

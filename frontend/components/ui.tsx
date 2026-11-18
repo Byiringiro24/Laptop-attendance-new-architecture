@@ -158,7 +158,7 @@ export function InfoRow({
 export function AutoConnectBadge({
   status, attempt,
 }: {
-  status: "connecting" | "connected" | "retrying";
+  status: "connecting" | "connected" | "retrying" | "offline";
   attempt: number;
 }) {
   if (status === "connected") {

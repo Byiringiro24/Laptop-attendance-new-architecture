@@ -20,6 +20,7 @@ backend/data/wireguard-private.key
 backend/data/wireguard-public.key
 backend/data/attendance-settings.json
 backend/data/poll-state.json
+backend/data/attendance-logs.json
 backend/data/students.json
 # Keep the cache directory structure (via .gitkeep) but ignore the actual photos
 backend/cache/photos/**/*.jpg

@@ -161,6 +161,7 @@ async function getWireGuardRuntimeStatus() {
 }
 
 const { DeviceBridgeManager } = require('./device-bridge');
+const { AttendanceLogStore } = require('./attendance-log-store');
 const app = express();
 
 app.use(cors());
@@ -169,6 +170,7 @@ app.use(express.json());
 const bridgeDir = path.join(__dirname, '..', 'FKBridge', 'bin', 'Release', 'net8.0');
 const bridgePath = path.join(bridgeDir, 'FKBridge.exe');
 const dataDir = path.join(__dirname, 'data');
+const attendanceLogStore = new AttendanceLogStore(path.join(dataDir, 'attendance-logs.json'));
 const studentsFile = path.join(dataDir, 'students.json');
 const attendanceSettingsFile = path.join(dataDir, 'attendance-settings.json');
 const pollStateFile = path.join(dataDir, 'poll-state.json');
@@ -237,7 +239,7 @@ function resolveSessionTarget(target = {}) {
 
 let fk623StatusInProgress = false; // prevent concurrent STATUS commands from /api/health
 let usersCache = [];
-let logsCache = [];
+let logsCache = attendanceLogStore.getAll();
 let students = loadStudents();
 let attendanceSettings = loadAttendanceSettings();
 const PHOTO_CACHE_ROOT = path.join(__dirname, 'cache', 'photos');
@@ -2131,23 +2133,23 @@ app.post('/api/devices-config/:id/push-students', requireDevPassword, async (req
 // No dev password required — this is called automatically by the server pull-logs job.
 app.post('/api/devices-config/:id/pull-logs', async (req, res) => {
   const bridge = bridgeManager.get(req.params.id);
-  if (!bridge) return res.status(404).json({ success: false, error: 'Device not found' });
-  if (!bridge.connected) return res.status(503).json({ success: false, error: 'Device not connected', code: 'device_not_connected' });
-
-  const readMark = req.body?.readMark === 1 || req.query.readMark === '1' ? 1 : 0;
-  let result = await bridge.send(`GET_LOGS|${readMark}`, 90000);
-
-  // Fallback: if readMark=1 returns nothing, re-fetch all logs
-  if (result.success && (result.data?.logs || []).length === 0 && readMark === 1) {
-    result = await bridge.send('GET_LOGS|0', 90000);
+  // Refresh from a reachable device, then serve the durable cache. If the
+  // device is offline, cached scans remain available for server-side syncing.
+  if (bridge?.connected) {
+    const result = await bridge.send('GET_LOGS|0', 90000);
+    if (result.success) {
+      attendanceLogStore.append(req.params.id, result.data?.logs || []);
+    } else if (bridge._isOfflineError(result.error)) {
+      sseEmit('devicesStatus', { id: req.params.id, connected: false, error: result.error, source: 'pull-logs' });
+    }
   }
 
-  if (!result.success && bridge._isOfflineError(result.error)) {
-    sseEmit('devicesStatus', { id: req.params.id, connected: false, error: result.error, source: 'pull-logs' });
-    return res.status(503).json({ ...result, code: 'device_not_connected' });
+  const cachedLogs = attendanceLogStore.getForDevice(req.params.id);
+  if (!bridge && !cachedLogs.length) return res.status(404).json({ success: false, error: 'Device not found' });
+  if (!cachedLogs.length && !bridge?.connected) {
+    return res.status(503).json({ success: false, error: 'Device not connected and no cached logs are available', code: 'device_not_connected' });
   }
-
-  res.json(result);
+  res.json({ success: true, data: { logs: cachedLogs, source: bridge?.connected ? 'device-cache' : 'local-cache' } });
 });
 
 // ── POST /api/devices-config/:id/clear-logs — clear logs on a specific device ──
@@ -2560,10 +2562,8 @@ app.get('/api/attendance/today', (req, res) => {
 });
 
 // POST /api/attendance/push-to-server
-// Pushes FK623 biometric attendance logs to the school server via /gate/logs.
-// Body: { since?: ISO-date-string } — optional, default = today only.
-// Requires staff to be logged in (schoolAuthToken must exist).
-// Returns: { success, pushed, failed, skipped, errors[] }
+// Trigger the server's supported pull pipeline. The server fetches each
+// tablet's durable local cache and deduplicates records in its database.
 app.post('/api/attendance/push-to-server', async (req, res) => {
   if (!schoolAuthToken) {
     return res.status(401).json({
@@ -2572,61 +2572,12 @@ app.post('/api/attendance/push-to-server', async (req, res) => {
     });
   }
 
-  // Decide which logs to push
-  const since = req.body?.since ? new Date(req.body.since) : null;
-  const logsToSend = since
-    ? logsCache.filter((log) => new Date(log.timestamp) >= since)
-    : logsCache;
-
-  if (logsToSend.length === 0) {
-    return res.json({ success: true, pushed: 0, failed: 0, skipped: 0, total: 0, message: 'No logs to push' });
+  try {
+    const { status, json } = await relayToServer('POST', '/tablets/pull-all-logs', {}, schoolAuthToken);
+    res.status(status).json(json);
+  } catch (err) {
+    res.status(502).json({ success: false, error: `Cannot reach school server: ${err.message}` });
   }
-
-  let pushed = 0;
-  let failed = 0;
-  const errors = [];
-
-  for (const raw of logsToSend) {
-    const log = attendanceFromLog(raw);
-    const payload = {
-      student_id:    log.studentDeviceId || raw.userId,
-      student_name:  log.studentName,
-      device_id:     log.deviceId || currentDevice?.deviceId || TABLET_UUID || 'tablet',
-      tablet_uuid:   TABLET_UUID || null,
-      method:        log.authenticationMethod,
-      direction:     log.direction || raw.direction || 'IN',
-      timestamp:     log.timestamp || raw.timestamp,
-      status:        log.status,
-      boot_id:       BOOT_ID,
-      log_id:        raw.id || null,
-    };
-
-    try {
-      const { status: httpStatus } = await relayToServer('POST', '/gate/logs', payload, schoolAuthToken);
-      if (httpStatus >= 200 && httpStatus < 300) {
-        pushed++;
-      } else {
-        failed++;
-        errors.push({ logId: raw.id, status: httpStatus });
-      }
-    } catch (err) {
-      failed++;
-      errors.push({ logId: raw.id, error: err.message });
-    }
-  }
-
-  console.log(`[AttendancePush] pushed=${pushed} failed=${failed} total=${logsToSend.length}`);
-  res.json({
-    success: failed === 0,
-    pushed,
-    failed,
-    skipped: logsCache.length - logsToSend.length,
-    total: logsToSend.length,
-    errors: errors.slice(0, 10), // cap at 10 so response stays small
-    message: failed === 0
-      ? `Successfully pushed ${pushed} attendance record(s) to school server`
-      : `Pushed ${pushed}, failed ${failed} — check errors array`,
-  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3965,9 +3916,13 @@ const deviceStatusMap = new Map();
 function onDeviceLog(deviceId, deviceConfig, newLogs) {
   if (!Array.isArray(newLogs) || !newLogs.length) return;
 
+  // Persist synchronously before DeviceBridge advances its poll cursor.
+  const durableLogs = attendanceLogStore.append(deviceId, newLogs);
+  if (!durableLogs.length) return;
+
   // Map raw FK623 log objects to the same shape attendanceFromLog produces
   // so the existing SSE / frontend code works without changes.
-  const mapped = newLogs.map(raw => ({
+  const mapped = durableLogs.map(raw => ({
     ...attendanceFromLog(raw),
     deviceConfigId: deviceId,
     deviceName:     deviceConfig.name || deviceConfig.ipAddress,
@@ -3982,35 +3937,7 @@ function onDeviceLog(deviceId, deviceConfig, newLogs) {
     sseEmit('attendance', truly_new);
     console.log(`[bridge-mgr:${deviceConfig.name || deviceId.slice(0,8)}] ${truly_new.length} new log(s) emitted`);
 
-    // ── Auto-push to school server immediately ───────────────────────────
-    // Push each new log to the school server as it arrives so the server
-    // has real-time data without waiting for a manual push or the server
-    // pull-logs job. Fire-and-forget — never block the log poll cycle.
-    if (schoolAuthToken) {
-      setImmediate(async () => {
-        let pushed = 0, failed = 0;
-        for (const log of truly_new) {
-          const payload = {
-            log_id:                String(log.id || ''),
-            user_id:               String(log.deviceUserId || log.userId || ''),
-            timestamp:             log.timestamp || new Date().toISOString(),
-            authentication_method: log.scanMethod || log.method || 'fingerprint',
-            direction:             log.direction || 'In',
-            device_id:             String(log.deviceId || deviceConfig.deviceId || deviceId),
-            raw_data:              log,
-          };
-          try {
-            const { status: s } = await relayToServer('POST', '/gate/logs', payload, schoolAuthToken);
-            if (s >= 200 && s < 300) pushed++; else failed++;
-          } catch { failed++; }
-        }
-        if (pushed > 0 || failed > 0) {
-          console.log(`[bridge-mgr:${deviceConfig.name || deviceId.slice(0,8)}] auto-pushed ${pushed} log(s) to server${failed ? `, ${failed} failed` : ''}`);
-        }
-      });
-    } else {
-      console.log(`[bridge-mgr:${deviceConfig.name || deviceId.slice(0,8)}] ${truly_new.length} log(s) cached locally — not logged in to school server`);
-    }
+    console.log(`[bridge-mgr:${deviceConfig.name || deviceId.slice(0,8)}] ${truly_new.length} log(s) saved locally for server pull sync`);
   }
 }
 
