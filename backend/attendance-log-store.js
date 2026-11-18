@@ -9,6 +9,12 @@ function stableLogKey(deviceId, log) {
   return [String(deviceId), logId || userId, timestamp, userId].join('|');
 }
 
+function deviceScopedLogId(deviceId, log) {
+  const localId = String(log?.id ?? log?.logId ?? log?.log_id ?? '').trim();
+  const fallback = stableLogKey(deviceId, log) || `${String(log?.userId ?? '')}|${String(log?.timestamp ?? '')}`;
+  return `${String(deviceId)}:${localId || fallback}`;
+}
+
 class AttendanceLogStore {
   constructor(filePath) {
     this.filePath = filePath;
@@ -73,4 +79,4 @@ class AttendanceLogStore {
   }
 }
 
-module.exports = { AttendanceLogStore, stableLogKey };
+module.exports = { AttendanceLogStore, stableLogKey, deviceScopedLogId };

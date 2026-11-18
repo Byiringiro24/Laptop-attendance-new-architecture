@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { AttendanceLogStore } = require('./attendance-log-store');
+const { AttendanceLogStore, deviceScopedLogId } = require('./attendance-log-store');
 
 test('attendance log store persists multiple devices and deduplicates per device', () => {
   const tempParent = path.join(__dirname, '.tmp');
@@ -24,4 +24,10 @@ test('attendance log store persists multiple devices and deduplicates per device
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
+});
+
+test('device-scoped dashboard IDs keep identical device counters distinct', () => {
+  const log = { id: 1, userId: '42', timestamp: '2026-11-18T08:00:00.000Z' };
+  assert.notEqual(deviceScopedLogId('gate-1', log), deviceScopedLogId('gate-2', log));
+  assert.equal(deviceScopedLogId('gate-1', log), deviceScopedLogId('gate-1', log));
 });

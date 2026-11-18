@@ -161,7 +161,7 @@ async function getWireGuardRuntimeStatus() {
 }
 
 const { DeviceBridgeManager } = require('./device-bridge');
-const { AttendanceLogStore } = require('./attendance-log-store');
+const { AttendanceLogStore, deviceScopedLogId } = require('./attendance-log-store');
 const app = express();
 
 app.use(cors());
@@ -239,9 +239,13 @@ function resolveSessionTarget(target = {}) {
 
 let fk623StatusInProgress = false; // prevent concurrent STATUS commands from /api/health
 let usersCache = [];
-let logsCache = attendanceLogStore.getAll();
+let logsCache = [];
 let students = loadStudents();
 let attendanceSettings = loadAttendanceSettings();
+logsCache = attendanceLogStore.getAll().map((log) => ({
+  ...log,
+  id: deviceScopedLogId(log.deviceConfigId || 'device', log),
+}));
 const PHOTO_CACHE_ROOT = path.join(__dirname, 'cache', 'photos');
 
 // ── Ensure the photo cache directory exists on startup ────────────────────────
@@ -3924,6 +3928,7 @@ function onDeviceLog(deviceId, deviceConfig, newLogs) {
   // so the existing SSE / frontend code works without changes.
   const mapped = durableLogs.map(raw => ({
     ...attendanceFromLog(raw),
+    id: deviceScopedLogId(deviceId, raw),
     deviceConfigId: deviceId,
     deviceName:     deviceConfig.name || deviceConfig.ipAddress,
     bootId:         deviceId, // use deviceId as stable boot namespace
